@@ -251,6 +251,13 @@ def _cfg_bool(config: AppConfig, name: str, default: bool = False) -> bool:
     return default
 
 
+def _cfg_int(config: AppConfig, name: str, default: int) -> int:
+    try:
+        return int(getattr(config, name, default))
+    except Exception:
+        return default
+
+
 def normalize_native_ollama_base_url(base_url: str) -> str:
     raw = (base_url or "").strip().rstrip("/")
     if not raw:
@@ -829,7 +836,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("TitleLabel")
 
         subtitle = QLabel(
-            "Streaming Ollama-style local chat with stable QTextBrowser layout, readable thinking, and no scroll jumping."
+            "Streaming Ollama-style local chat with tools, attachments, Tor options, and local Python project scanning."
         )
         subtitle.setObjectName("MutedLabel")
         subtitle.setWordWrap(True)
@@ -913,6 +920,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_chat_tab(), "Chat")
         tabs.addTab(self._build_settings_tab(), "Settings")
+        tabs.addTab(self._build_project_tab(), "Project Tools")
         return tabs
 
     def _build_chat_tab(self) -> QWidget:
@@ -1093,7 +1101,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(prompt_label)
 
         prompt_hint = QLabel(
-            "This keeps the original chat-window layout, but throttles streamed updates so thinking text does not flash or force-scroll."
+            "The project tool rules should tell the model to use project_status first, then search/read/run diagnostics."
         )
         prompt_hint.setObjectName("MutedLabel")
         prompt_hint.setWordWrap(True)
@@ -1105,6 +1113,137 @@ class MainWindow(QMainWindow):
 
         return page
 
+    def _build_project_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+
+        project_label = QLabel("Local Python Project Tools")
+        project_label.setObjectName("SectionLabel")
+        outer.addWidget(project_label)
+
+        hint = QLabel(
+            "Set a project directory here. The GPT runtime can then scan code, read files, run allowlisted diagnostics, "
+            "and optionally write files if you enable writes."
+        )
+        hint.setObjectName("MutedLabel")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        form_panel = QFrame()
+        form_layout = QFormLayout(form_panel)
+        form_layout.setContentsMargins(10, 10, 10, 10)
+        form_layout.setSpacing(10)
+
+        project_dir_row = QHBoxLayout()
+        self.local_project_dir_input = QLineEdit(str(_cfg_get(self.config, "local_project_dir", "")))
+        self.local_project_dir_input.setPlaceholderText(r"X:\Users\natem\PycharmProjects\ChatProject")
+
+        self.browse_project_dir_button = QPushButton("Browse")
+        self.browse_project_dir_button.setObjectName("Secondary")
+        self.browse_project_dir_button.clicked.connect(self.browse_project_dir)
+
+        project_dir_row.addWidget(self.local_project_dir_input, 1)
+        project_dir_row.addWidget(self.browse_project_dir_button)
+
+        self.project_tools_enabled_checkbox = QCheckBox("Enable project tools")
+        self.project_tools_enabled_checkbox.setChecked(_cfg_bool(self.config, "project_tools_enabled", True))
+
+        self.project_run_enabled_checkbox = QCheckBox("Allow safe command execution")
+        self.project_run_enabled_checkbox.setChecked(_cfg_bool(self.config, "project_run_enabled", True))
+
+        self.project_write_enabled_checkbox = QCheckBox("Allow GPT to write/patch files")
+        self.project_write_enabled_checkbox.setChecked(_cfg_bool(self.config, "project_write_enabled", False))
+
+        self.project_command_timeout_input = QSpinBox()
+        self.project_command_timeout_input.setRange(1, 100000)
+        self.project_command_timeout_input.setValue(_cfg_int(self.config, "project_command_timeout_sec", 30))
+
+        self.project_max_output_chars_input = QSpinBox()
+        self.project_max_output_chars_input.setRange(1000, 500000)
+        self.project_max_output_chars_input.setSingleStep(1000)
+        self.project_max_output_chars_input.setValue(_cfg_int(self.config, "project_max_output_chars", 14000))
+
+        self.project_max_file_chars_input = QSpinBox()
+        self.project_max_file_chars_input.setRange(1000, 1000000)
+        self.project_max_file_chars_input.setSingleStep(5000)
+        self.project_max_file_chars_input.setValue(_cfg_int(self.config, "project_max_file_chars", 160000))
+
+        self.project_max_scan_files_input = QSpinBox()
+        self.project_max_scan_files_input.setRange(10, 200000)
+        self.project_max_scan_files_input.setSingleStep(100)
+        self.project_max_scan_files_input.setValue(_cfg_int(self.config, "project_max_scan_files", 3000))
+
+        self.project_command_allowlist_input = QLineEdit(
+            str(_cfg_get(self.config, "project_command_allowlist", "python,py,pytest,ruff,mypy,pyright,pip"))
+        )
+
+        self.project_extra_ignore_dirs_input = QLineEdit(str(_cfg_get(self.config, "project_extra_ignore_dirs", "")))
+        self.project_extra_ignore_dirs_input.setPlaceholderText("comma,separated,extra,dirs")
+
+        form_layout.addRow("Project Directory", project_dir_row)
+        form_layout.addRow("Tools Enabled", self.project_tools_enabled_checkbox)
+        form_layout.addRow("Run Enabled", self.project_run_enabled_checkbox)
+        form_layout.addRow("Write Enabled", self.project_write_enabled_checkbox)
+        form_layout.addRow("Command Timeout", self.project_command_timeout_input)
+        form_layout.addRow("Max Output Chars", self.project_max_output_chars_input)
+        form_layout.addRow("Max File Chars", self.project_max_file_chars_input)
+        form_layout.addRow("Max Scan Files", self.project_max_scan_files_input)
+        form_layout.addRow("Command Allowlist", self.project_command_allowlist_input)
+        form_layout.addRow("Extra Ignore Dirs", self.project_extra_ignore_dirs_input)
+
+        outer.addWidget(form_panel)
+
+        row = QHBoxLayout()
+
+        self.project_save_button = QPushButton("Save Project Config")
+        self.project_save_button.clicked.connect(self.save_settings)
+
+        self.project_insert_prompt_button = QPushButton("Insert Project Diagnostic Prompt")
+        self.project_insert_prompt_button.setObjectName("Secondary")
+        self.project_insert_prompt_button.clicked.connect(self.insert_project_diagnostic_prompt)
+
+        row.addWidget(self.project_save_button)
+        row.addWidget(self.project_insert_prompt_button)
+        row.addStretch(1)
+
+        outer.addLayout(row)
+
+        help_box = QPlainTextEdit()
+        help_box.setReadOnly(True)
+        help_box.setPlainText(
+            "Recommended test prompt:\n\n"
+            "Use the project tools. First call project_status, then project_tree. "
+            "Find import or syntax errors in my local project. Read the relevant files, "
+            "run py_compile on likely entry files, and tell me the exact fixes.\n\n"
+            "Safety:\n"
+            "- Commands use shell=False.\n"
+            "- Only allowlisted commands can run.\n"
+            "- File writes stay disabled unless Write Enabled is checked.\n"
+            "- .env/private-key style files are blocked by project_tools.py."
+        )
+        outer.addWidget(help_box, 1)
+
+        return page
+
+    def browse_project_dir(self) -> None:
+        start = self.local_project_dir_input.text().strip() or str(Path.cwd())
+        path = QFileDialog.getExistingDirectory(self, "Select Local Python Project Directory", start)
+
+        if path:
+            self.local_project_dir_input.setText(path)
+            self.update_status_banner(f"Selected project directory: {path}")
+
+    def insert_project_diagnostic_prompt(self) -> None:
+        prompt = (
+            "Use the project tools. First call project_status, then project_tree. "
+            "Find import or syntax errors in my local project. Read the relevant files, "
+            "run py_compile on likely entry files, and tell me the exact fixes."
+        )
+        self.prompt_input.setPlainText(prompt)
+        self.update_status_banner("Inserted project diagnostic prompt.")
+
     def update_status_banner(self, message: str) -> None:
         self.session_badge.setText(f"Session: {self.current_session_id or '(none)'}")
 
@@ -1113,15 +1252,18 @@ class MainWindow(QMainWindow):
         stream_state = "stream:on" if _cfg_bool(self.config, "stream_chat", True) else "stream:off"
         tor_state = "tor:web" if _cfg_bool(self.config, "prefer_tor_for_web", False) else "tor:manual"
 
+        project_dir = str(_cfg_get(self.config, "local_project_dir", "") or "").strip()
+        project_state = "project:on" if project_dir and _cfg_bool(self.config, "project_tools_enabled", True) else "project:off"
+
         self.backend_badge.setText(
             f"{self.config.model} | {normalize_native_ollama_base_url(self.config.base_url)} | "
-            f"{stream_state} | {thinking_state} | {trace_state} | {tor_state}"
+            f"{stream_state} | {thinking_state} | {trace_state} | {tor_state} | {project_state}"
         )
 
         self.statusBar().showMessage(message)
 
     def build_config_from_form(self) -> AppConfig:
-        return AppConfig(
+        cfg = AppConfig(
             base_url=normalize_native_ollama_base_url(self.base_url_input.text().strip() or self.config.base_url),
             model=self.model_input.currentText().strip() or self.config.model,
             api_key=self.api_key_input.text().strip() or "ollama",
@@ -1141,6 +1283,19 @@ class MainWindow(QMainWindow):
             stream_chat=bool(self.stream_chat_checkbox.isChecked()),
         )
 
+        cfg.local_project_dir = self.local_project_dir_input.text().strip()
+        cfg.project_tools_enabled = bool(self.project_tools_enabled_checkbox.isChecked())
+        cfg.project_run_enabled = bool(self.project_run_enabled_checkbox.isChecked())
+        cfg.project_write_enabled = bool(self.project_write_enabled_checkbox.isChecked())
+        cfg.project_command_timeout_sec = int(self.project_command_timeout_input.value())
+        cfg.project_max_output_chars = int(self.project_max_output_chars_input.value())
+        cfg.project_max_file_chars = int(self.project_max_file_chars_input.value())
+        cfg.project_max_scan_files = int(self.project_max_scan_files_input.value())
+        cfg.project_command_allowlist = self.project_command_allowlist_input.text().strip()
+        cfg.project_extra_ignore_dirs = self.project_extra_ignore_dirs_input.text().strip()
+
+        return cfg
+
     def apply_config_to_form(self, config: AppConfig) -> None:
         self.base_url_input.setText(normalize_native_ollama_base_url(config.base_url))
         self.model_input.setEditText(config.model)
@@ -1156,6 +1311,19 @@ class MainWindow(QMainWindow):
         self.show_thinking_checkbox.setChecked(_cfg_bool(config, "show_thinking", True))
         self.show_tool_trace_checkbox.setChecked(_cfg_bool(config, "show_tool_trace", False))
         self.stream_chat_checkbox.setChecked(_cfg_bool(config, "stream_chat", True))
+
+        self.local_project_dir_input.setText(str(_cfg_get(config, "local_project_dir", "")))
+        self.project_tools_enabled_checkbox.setChecked(_cfg_bool(config, "project_tools_enabled", True))
+        self.project_run_enabled_checkbox.setChecked(_cfg_bool(config, "project_run_enabled", True))
+        self.project_write_enabled_checkbox.setChecked(_cfg_bool(config, "project_write_enabled", False))
+        self.project_command_timeout_input.setValue(_cfg_int(config, "project_command_timeout_sec", 30))
+        self.project_max_output_chars_input.setValue(_cfg_int(config, "project_max_output_chars", 14000))
+        self.project_max_file_chars_input.setValue(_cfg_int(config, "project_max_file_chars", 160000))
+        self.project_max_scan_files_input.setValue(_cfg_int(config, "project_max_scan_files", 3000))
+        self.project_command_allowlist_input.setText(
+            str(_cfg_get(config, "project_command_allowlist", "python,py,pytest,ruff,mypy,pyright,pip"))
+        )
+        self.project_extra_ignore_dirs_input.setText(str(_cfg_get(config, "project_extra_ignore_dirs", "")))
 
     def save_settings(self) -> None:
         self.config = self.build_config_from_form()
@@ -1578,6 +1746,9 @@ class MainWindow(QMainWindow):
         self.reload_config_button.setEnabled(enabled)
         self.save_prompt_button.setEnabled(enabled)
         self.load_models_button.setEnabled(enabled)
+        self.project_save_button.setEnabled(enabled)
+        self.project_insert_prompt_button.setEnabled(enabled)
+        self.browse_project_dir_button.setEnabled(enabled)
 
     def _thread_connect(self, signal: Callable, slot: Callable) -> None:
         signal.connect(slot)

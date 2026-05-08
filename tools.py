@@ -11,11 +11,21 @@ from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 import requests
 
-from retrieval import SimpleFileRetrieval
+try:
+    from retrieval import SimpleFileRetrieval
+except Exception:
+    SimpleFileRetrieval = None
+
+try:
+    from project_tools import LocalPythonProjectTools
+except Exception:
+    LocalPythonProjectTools = None
+
 
 DEFAULT_WEB_TIMEOUT_SEC = 20
 DEFAULT_MAX_PAGE_CHARS = 12000
 DEFAULT_TOR_SOCKS_URL = "socks5h://127.0.0.1:9150"
+
 
 STOPWORDS = {
     "the",
@@ -70,6 +80,7 @@ STOPWORDS = {
     "new",
 }
 
+
 BAD_RESULT_DOMAINS = {
     "duckduckgo.com",
     "www.duckduckgo.com",
@@ -81,6 +92,7 @@ BAD_RESULT_DOMAINS = {
     "yahoo.com",
     "www.yahoo.com",
 }
+
 
 GOOD_BONUS_DOMAINS = {
     "docs.python-requests.org",
@@ -122,12 +134,22 @@ class ToolRegistry:
     def register(self, tool: ToolSpec) -> None:
         self._tools[tool.name] = tool
 
+    def names(self) -> List[str]:
+        return sorted(self._tools.keys())
+
     def schemas(self) -> List[Dict[str, Any]]:
         return [tool.as_ollama_tool() for tool in self._tools.values()]
 
     def call(self, name: str, arguments: Any) -> str:
         if name not in self._tools:
-            return json.dumps({"ok": False, "error": f"Unknown tool: {name}"}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": f"Unknown tool: {name}",
+                    "available_tools": self.names(),
+                },
+                ensure_ascii=False,
+            )
 
         if isinstance(arguments, str):
             try:
@@ -173,9 +195,11 @@ def get_time() -> Dict[str, str]:
 def save_note(title: str, body: str) -> Dict[str, Any]:
     notes_dir = Path("data/notes")
     notes_dir.mkdir(parents=True, exist_ok=True)
+
     safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip() or "note"
     note_path = notes_dir / f"{safe_title}.txt"
     note_path.write_text(body, encoding="utf-8")
+
     return {"ok": True, "saved_to": str(note_path)}
 
 
@@ -189,9 +213,15 @@ def list_notes() -> Dict[str, Any]:
 def read_note(title: str) -> Dict[str, Any]:
     notes_dir = Path("data/notes")
     note_path = notes_dir / f"{title}.txt"
+
     if not note_path.exists():
         return {"ok": False, "error": f"Note not found: {title}.txt"}
-    return {"ok": True, "title": title, "content": note_path.read_text(encoding="utf-8")}
+
+    return {
+        "ok": True,
+        "title": title,
+        "content": note_path.read_text(encoding="utf-8"),
+    }
 
 
 def search_local_knowledge(
@@ -200,6 +230,12 @@ def search_local_knowledge(
     per_file_limit: int = 2,
     excerpt_chars: int = 800,
 ) -> Dict[str, Any]:
+    if SimpleFileRetrieval is None:
+        return {
+            "ok": False,
+            "error": "SimpleFileRetrieval is not available. Check retrieval.py.",
+        }
+
     retriever = SimpleFileRetrieval()
     results = retriever.search(
         query=query,
@@ -207,6 +243,7 @@ def search_local_knowledge(
         per_file_limit=per_file_limit,
         excerpt_chars=excerpt_chars,
     )
+
     return {
         "ok": True,
         "query": query,
@@ -217,6 +254,7 @@ def search_local_knowledge(
 
 def _normalize_url(url: str) -> str:
     raw = (url or "").strip()
+
     if not raw:
         raise ValueError("URL is required.")
 
@@ -228,6 +266,7 @@ def _normalize_url(url: str) -> str:
             raw = "https://" + raw
 
     parsed = urlparse(raw)
+
     if not parsed.scheme or not parsed.netloc:
         raise ValueError(f"Invalid URL: {url}")
 
@@ -325,10 +364,12 @@ def _extract_links_from_html(base_url: str, html_text: str, max_links: int = 50)
         html_text or "",
     ):
         href = html.unescape(href).strip()
+
         if not href:
             continue
 
         lower_href = href.lower()
+
         if href.startswith("#") or lower_href.startswith("javascript:") or lower_href.startswith("mailto:"):
             continue
 
@@ -530,10 +571,9 @@ def check_tor_proxy(
     tor_socks_url: str = DEFAULT_TOR_SOCKS_URL,
     timeout_sec: int = 8,
 ) -> Dict[str, Any]:
-    effective_proxy = tor_socks_url or DEFAULT_TOR_SOCKS_URL
     session, timeout_value = _make_session(
         timeout_sec=timeout_sec,
-        tor_socks_url=effective_proxy,
+        tor_socks_url=tor_socks_url or DEFAULT_TOR_SOCKS_URL,
     )
 
     try:
@@ -543,227 +583,121 @@ def check_tor_proxy(
         )
         response.raise_for_status()
         data = response.json()
-
         return {
             "ok": True,
-            "tor_socks_url": effective_proxy,
-            "tor_available": bool(data.get("IsTor")),
+            "tor_socks_url": tor_socks_url,
+            "is_tor": bool(data.get("IsTor")),
             "ip": data.get("IP", ""),
             "raw": data,
         }
-    except requests.RequestException as exc:
+    except Exception as exc:
         return {
             "ok": False,
-            "tor_socks_url": effective_proxy,
-            "error": f"Tor proxy check failed: {exc}",
-            "hint": (
-                "Make sure Tor Browser is open for 127.0.0.1:9150, "
-                "or use the Tor daemon/service with 127.0.0.1:9050. "
-                "Also install requests[socks]."
-            ),
-        }
-    except ValueError as exc:
-        return {
-            "ok": False,
-            "tor_socks_url": effective_proxy,
-            "error": f"Tor proxy responded with invalid JSON: {exc}",
+            "tor_socks_url": tor_socks_url,
+            "error": str(exc),
+            "hint": "Start Tor Browser or Tor daemon and install requests[socks] if needed.",
         }
     finally:
         session.close()
 
 
-def _tokenize(text: str) -> List[str]:
-    return [
-        t.lower()
-        for t in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9._:-]*", text or "")
-        if t.strip()
-    ]
-
-
 def _rewrite_query(query: str) -> List[str]:
-    raw = " ".join((query or "").strip().split())
+    raw = (query or "").strip()
+
     if not raw:
         return []
 
-    lowered = raw.lower()
-    tokens = [t for t in _tokenize(lowered) if t not in STOPWORDS]
-    quoted = re.findall(r'"([^"]+)"', raw)
-    phrases = [p.strip() for p in quoted if p.strip()]
+    terms = []
+    for token in re.findall(r"[A-Za-z0-9_'\-]+", raw):
+        t = token.lower().strip("'")
+        if len(t) >= 3 and t not in STOPWORDS:
+            terms.append(token)
 
-    variants: List[str] = [raw]
+    compact = " ".join(terms[:12]).strip()
+    rewrites = [raw]
 
-    if phrases:
-        variants.extend(phrases)
+    if compact and compact != raw:
+        rewrites.append(compact)
 
-    if tokens:
-        variants.append(" ".join(tokens[:8]))
-
-    core = [t for t in tokens if len(t) > 2]
-    if core:
-        variants.append(" ".join(core[:5]))
-
-    cleaned: List[str] = []
-    seen = set()
-
-    for q in variants:
-        q = " ".join(q.split()).strip()
-        if not q:
-            continue
-
-        key = q.lower()
-        if key in seen:
-            continue
-
-        seen.add(key)
-        cleaned.append(q)
-
-    return cleaned[:4]
+    return list(dict.fromkeys(rewrites))
 
 
-def _extract_duckduckgo_results(html_text: str, max_results: int) -> List[Dict[str, str]]:
-    results: List[Dict[str, str]] = []
-    seen: set[str] = set()
+def _extract_duckduckgo_results(body: str, max_results: int = 20) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
 
-    patterns = [
-        re.compile(
-            r'<a[^>]+class="[^"]*\bresult__a\b[^"]*"[^>]+href="(.*?)"[^>]*>(.*?)</a>',
-            re.IGNORECASE | re.DOTALL,
-        ),
-        re.compile(
-            r'<a[^>]+rel="nofollow"[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
-            re.IGNORECASE | re.DOTALL,
-        ),
-        re.compile(
-            r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
-            re.IGNORECASE | re.DOTALL,
-        ),
-    ]
+    for match in re.finditer(
+        r'(?is)<a[^>]+class=["\'][^"\']*result__a[^"\']*["\'][^>]+href=["\'](.*?)["\'][^>]*>(.*?)</a>',
+        body or "",
+    ):
+        url = html.unescape(match.group(1))
+        title = _clean_html_to_text(match.group(2))
 
-    snippet_pattern = re.compile(
-        r'<a[^>]+class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</a>'
-        r"|"
-        r'<div[^>]+class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</div>',
-        re.IGNORECASE | re.DOTALL,
-    )
+        if "uddg=" in url:
+            m = re.search(r"[?&]uddg=([^&]+)", url)
+            if m:
+                url = unquote(m.group(1))
 
-    flat_snippets: List[str] = []
-    for a, b in snippet_pattern.findall(html_text or ""):
-        snippet_html = a or b
-        flat_snippets.append(_clean_html_to_text(snippet_html)[:400])
+        out.append({"title": title, "url": url, "snippet": ""})
 
-    for pattern in patterns:
-        for idx, (href, title_html) in enumerate(pattern.findall(html_text or "")):
-            href = html.unescape(href).strip()
-            title = _clean_html_to_text(title_html).strip()
-
-            if not href or not title:
-                continue
-
-            if "duckduckgo.com/l/?" in href:
-                m = re.search(r"[?&]uddg=([^&]+)", href)
-                if m:
-                    href = unquote(m.group(1))
-
-            if not href.startswith("http"):
-                continue
-
-            domain = urlparse(href).netloc.lower()
-            if domain in BAD_RESULT_DOMAINS:
-                continue
-
-            if href in seen:
-                continue
-
-            seen.add(href)
-
-            snippet = flat_snippets[idx] if idx < len(flat_snippets) else ""
-
-            results.append(
-                {
-                    "title": title[:300],
-                    "url": href,
-                    "domain": domain,
-                    "snippet": snippet,
-                }
-            )
-
-            if len(results) >= max_results:
-                return results
-
-        if results:
-            return results
-
-    return results
-
-
-def _extract_generic_results(html_text: str, max_results: int) -> List[Dict[str, str]]:
-    results: List[Dict[str, str]] = []
-    seen: set[str] = set()
-
-    pattern = re.compile(
-        r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    for href, title_html in pattern.findall(html_text or ""):
-        href = html.unescape(href).strip()
-        title = _clean_html_to_text(title_html).strip()
-
-        if not href or not title:
-            continue
-
-        domain = urlparse(href).netloc.lower()
-        if domain in BAD_RESULT_DOMAINS:
-            continue
-
-        if href in seen:
-            continue
-
-        seen.add(href)
-
-        results.append(
-            {
-                "title": title[:300],
-                "url": href,
-                "domain": domain,
-                "snippet": "",
-            }
-        )
-
-        if len(results) >= max_results:
+        if len(out) >= max_results:
             break
 
-    return results
+    if out:
+        return out
+
+    for match in re.finditer(
+        r'(?is)<a[^>]+href=["\'](https?://[^"\']+)["\'][^>]*>(.*?)</a>',
+        body or "",
+    ):
+        url = html.unescape(match.group(1))
+        title = _clean_html_to_text(match.group(2))
+        host = urlparse(url).netloc.lower()
+
+        if title and host not in BAD_RESULT_DOMAINS:
+            out.append({"title": title[:300], "url": url, "snippet": ""})
+
+        if len(out) >= max_results:
+            break
+
+    return out
 
 
-def _score_result(result: Dict[str, str], original_query: str) -> float:
-    title = (result.get("title") or "").lower()
-    snippet = (result.get("snippet") or "").lower()
-    domain = (result.get("domain") or "").lower()
-    url = (result.get("url") or "").lower()
+def _extract_generic_results(body: str, max_results: int = 20) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
 
-    query_tokens = [t for t in _tokenize(original_query) if t not in STOPWORDS]
-    score = 0.0
-    haystack = f"{title} {snippet} {url}"
+    for match in re.finditer(r"https?://[^\s\"'<>]+", body or ""):
+        url = html.unescape(match.group(0)).rstrip(").,;")
+        host = urlparse(url).netloc.lower()
 
-    for token in query_tokens:
-        if token in title:
-            score += 3.0
-        elif token in snippet:
+        if host in BAD_RESULT_DOMAINS or url in seen:
+            continue
+
+        seen.add(url)
+        out.append({"title": url, "url": url, "snippet": ""})
+
+        if len(out) >= max_results:
+            break
+
+    return out
+
+
+def _score_result(item: Dict[str, Any], query: str) -> float:
+    hay = f"{item.get('title', '')} {item.get('snippet', '')} {item.get('url', '')}".lower()
+
+    terms = [
+        t.lower()
+        for t in re.findall(r"[A-Za-z0-9_'\-]+", query or "")
+        if len(t) > 2 and t.lower() not in STOPWORDS
+    ]
+
+    score = sum(1.0 for t in terms if t in hay)
+
+    host = urlparse(item.get("url", "")).netloc.lower()
+    for good in GOOD_BONUS_DOMAINS:
+        if host == good or host.endswith("." + good):
             score += 1.5
-        elif token in url:
-            score += 1.0
-        elif token in haystack:
-            score += 0.5
-
-    if domain in GOOD_BONUS_DOMAINS:
-        score += 2.0
-
-    if domain in BAD_RESULT_DOMAINS:
-        score -= 10.0
-
-    if not snippet:
-        score -= 0.5
+            break
 
     return score
 
@@ -775,10 +709,8 @@ def search_web(
     tor_socks_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     raw_query = (query or "").strip()
-    if not raw_query:
-        return {"ok": False, "error": "Query is required."}
-
     rewrites = _rewrite_query(raw_query)
+
     if not rewrites:
         return {"ok": False, "error": "Could not generate search queries."}
 
@@ -803,17 +735,14 @@ def search_web(
 
             for search_url in candidate_urls:
                 try:
-                    response = session.get(
-                        search_url,
-                        timeout=timeout_value,
-                        allow_redirects=True,
-                    )
+                    response = session.get(search_url, timeout=timeout_value, allow_redirects=True)
                     response.raise_for_status()
                     body = response.text or ""
                 except requests.RequestException:
                     continue
 
                 parsed = _extract_duckduckgo_results(body, max_results=max_results * 3)
+
                 if not parsed:
                     parsed = _extract_generic_results(body, max_results=max_results * 3)
 
@@ -823,6 +752,7 @@ def search_web(
 
             for item in parsed_any:
                 url = item.get("url", "")
+
                 if not url or url in seen_urls:
                     continue
 
@@ -831,14 +761,6 @@ def search_web(
                 item["score"] = _score_result(item, raw_query)
                 all_results.append(item)
 
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "mode": mode,
-            "query": raw_query,
-            "error": f"Search failed: {exc}",
-            "tor_socks_url": tor_socks_url or "",
-        }
     finally:
         session.close()
 
@@ -870,10 +792,277 @@ def search_tor(
     )
 
 
+def _register_project_tools(tools: ToolRegistry, app_config: Any = None) -> None:
+    if app_config is None:
+        return
+
+    if not bool(getattr(app_config, "project_tools_enabled", True)):
+        return
+
+    if LocalPythonProjectTools is None:
+        return
+
+    project = LocalPythonProjectTools.from_app_config(app_config)
+
+    if project is None:
+        return
+
+    tools.register(
+        ToolSpec(
+            name="project_status",
+            description=(
+                "Return the configured local Python project root and enabled capabilities. "
+                "Use this first before project scanning or running."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            fn=lambda: project.project_status(),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="project_tree",
+            description=(
+                "List files in the configured local Python project. "
+                "Use this before reading files."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "max_files": {"type": "integer", "minimum": 1, "maximum": 3000},
+                    "suffix": {"type": "string", "description": "Optional suffix filter, such as .py"},
+                    "include_hidden": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+            fn=lambda max_files=350, suffix="", include_hidden=False: project.project_tree(
+                max_files=max_files,
+                suffix=suffix,
+                include_hidden=include_hidden,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="read_project_file",
+            description=(
+                "Read a text/code file from the configured local project root. "
+                "Path must stay inside the project root."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "max_chars": {"type": "integer", "minimum": 100, "maximum": 300000},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            fn=lambda path, max_chars=None: project.read_project_file(
+                path=path,
+                max_chars=max_chars,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="search_project",
+            description=(
+                "Search the configured local Python project for code/text and return ranked excerpts. "
+                "Use this to locate classes, methods, errors, configs, and imports."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "context_chars": {"type": "integer", "minimum": 80, "maximum": 4000},
+                    "suffix": {"type": "string"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            fn=lambda query, max_results=25, context_chars=700, suffix="": project.search_project(
+                query=query,
+                max_results=max_results,
+                context_chars=context_chars,
+                suffix=suffix,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="summarize_project",
+            description=(
+                "Build a structural summary of the configured Python project: files, packages, "
+                "classes, functions, and imports."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "max_files": {"type": "integer", "minimum": 50, "maximum": 5000},
+                },
+                "additionalProperties": False,
+            },
+            fn=lambda max_files=1000: project.summarize_project(max_files=max_files),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="run_project_command",
+            description=(
+                "Run an allowlisted command in the configured local project without shell=True. "
+                "Use for tests, linting, py_compile, or safe diagnostics."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ]
+                    },
+                    "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 300},
+                    "cwd": {"type": "string"},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+            fn=lambda command, timeout_sec=None, cwd=".": project.run_project_command(
+                command=command,
+                timeout_sec=timeout_sec,
+                cwd=cwd,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="run_python_file",
+            description="Run a Python file inside the configured local project root.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 300},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            fn=lambda path, args=None, timeout_sec=None: project.run_python_file(
+                path=path,
+                args=args,
+                timeout_sec=timeout_sec,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="compile_python_file",
+            description="Run python -m py_compile on a Python file inside the configured project.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 300},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            fn=lambda path, timeout_sec=None: project.compile_python_file(
+                path=path,
+                timeout_sec=timeout_sec,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="run_pytest",
+            description="Run pytest -q against the configured local Python project and return stdout/stderr.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 300},
+                    "extra_args": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": False,
+            },
+            fn=lambda target="", timeout_sec=None, extra_args=None: project.run_pytest(
+                target=target,
+                timeout_sec=timeout_sec,
+                extra_args=extra_args,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="run_ruff",
+            description=(
+                "Run ruff check against the configured project. "
+                "fix=true only works when project_write_enabled is true."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "fix": {"type": "boolean"},
+                    "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 300},
+                },
+                "additionalProperties": False,
+            },
+            fn=lambda target=".", fix=False, timeout_sec=None: project.run_ruff(
+                target=target,
+                fix=fix,
+                timeout_sec=timeout_sec,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="write_project_file",
+            description=(
+                "Write a text/code file inside the configured project. "
+                "Disabled unless project_write_enabled=true."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "create_dirs": {"type": "boolean"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+            fn=lambda path, content, create_dirs=True: project.write_project_file(
+                path=path,
+                content=content,
+                create_dirs=create_dirs,
+            ),
+        )
+    )
+
+
 def build_default_tool_registry(
     *,
     tor_socks_url: str = DEFAULT_TOR_SOCKS_URL,
     prefer_tor_for_web: bool = False,
+    app_config: Any = None,
 ) -> ToolRegistry:
     tools = ToolRegistry()
     tor_socks_url_config = tor_socks_url or DEFAULT_TOR_SOCKS_URL
@@ -927,7 +1116,7 @@ def build_default_tool_registry(
     tools.register(
         ToolSpec(
             name="read_note",
-            description="Read one saved note by its title without the .txt extension.",
+            description="Read one saved note by title without .txt.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -943,7 +1132,7 @@ def build_default_tool_registry(
     tools.register(
         ToolSpec(
             name="search_local_knowledge",
-            description="Search local text and code files in data/knowledge and return the most relevant excerpts.",
+            description="Search local text/code files in data/knowledge.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -962,11 +1151,7 @@ def build_default_tool_registry(
     tools.register(
         ToolSpec(
             name="browse_web",
-            description=(
-                "Fetch a web page and return readable text content. "
-                "Normally uses the direct internet. If app config prefer_tor_for_web is true, "
-                "this automatically routes through Tor."
-            ),
+            description="Fetch a normal web page and return readable text.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -977,38 +1162,21 @@ def build_default_tool_registry(
                 "required": ["url"],
                 "additionalProperties": False,
             },
-            fn=lambda url, max_chars=DEFAULT_MAX_PAGE_CHARS, timeout_sec=DEFAULT_WEB_TIMEOUT_SEC: browse_tor(
-                url=url,
-                max_chars=max_chars,
-                timeout_sec=timeout_sec,
-                tor_socks_url=tor_socks_url_config,
-            )
-            if prefer_tor_for_web
-            else browse_web(
-                url=url,
-                max_chars=max_chars,
-                timeout_sec=timeout_sec,
-            ),
+            fn=browse_web,
         )
     )
 
     tools.register(
         ToolSpec(
             name="browse_tor",
-            description=(
-                "Fetch a web page through the configured local Tor SOCKS proxy and return readable text content. "
-                "Use for explicit Tor-routed browsing or .onion pages."
-            ),
+            description="Fetch a web page through Tor SOCKS proxy.",
             parameters={
                 "type": "object",
                 "properties": {
                     "url": {"type": "string"},
                     "max_chars": {"type": "integer", "minimum": 500, "maximum": 50000},
                     "timeout_sec": {"type": "integer", "minimum": 3, "maximum": 180},
-                    "tor_socks_url": {
-                        "type": "string",
-                        "description": "Optional override. Usually leave blank to use app config.",
-                    },
+                    "tor_socks_url": {"type": "string"},
                 },
                 "required": ["url"],
                 "additionalProperties": False,
@@ -1024,36 +1192,8 @@ def build_default_tool_registry(
 
     tools.register(
         ToolSpec(
-            name="check_tor_proxy",
-            description=(
-                "Check whether the configured local Tor SOCKS proxy is reachable "
-                "and whether requests appear to exit through Tor."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "tor_socks_url": {
-                        "type": "string",
-                        "description": "Optional override. Usually leave blank to use app config.",
-                    },
-                    "timeout_sec": {"type": "integer", "minimum": 3, "maximum": 60},
-                },
-                "additionalProperties": False,
-            },
-            fn=lambda tor_socks_url="", timeout_sec=8: check_tor_proxy(
-                tor_socks_url=effective_tor_url(tor_socks_url),
-                timeout_sec=timeout_sec,
-            ),
-        )
-    )
-
-    tools.register(
-        ToolSpec(
             name="extract_links",
-            description=(
-                "Fetch a page and return outgoing links with anchor text. "
-                "Normally uses the direct internet unless prefer_tor_for_web is enabled."
-            ),
+            description="Fetch a normal page and return outgoing links.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -1064,39 +1204,21 @@ def build_default_tool_registry(
                 "required": ["url"],
                 "additionalProperties": False,
             },
-            fn=lambda url, timeout_sec=DEFAULT_WEB_TIMEOUT_SEC, max_links=25: extract_links_tor(
-                url=url,
-                timeout_sec=timeout_sec,
-                max_links=max_links,
-                tor_socks_url=tor_socks_url_config,
-            )
-            if prefer_tor_for_web
-            else extract_links(
-                url=url,
-                timeout_sec=timeout_sec,
-                max_links=max_links,
-                tor_socks_url=None,
-            ),
+            fn=extract_links,
         )
     )
 
     tools.register(
         ToolSpec(
             name="extract_links_tor",
-            description=(
-                "Fetch a page through Tor and return outgoing links with anchor text. "
-                "Use for explicit Tor-routed link extraction or .onion pages."
-            ),
+            description="Fetch a page through Tor and return outgoing links.",
             parameters={
                 "type": "object",
                 "properties": {
                     "url": {"type": "string"},
                     "timeout_sec": {"type": "integer", "minimum": 3, "maximum": 180},
                     "max_links": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "tor_socks_url": {
-                        "type": "string",
-                        "description": "Optional override. Usually leave blank to use app config.",
-                    },
+                    "tor_socks_url": {"type": "string"},
                 },
                 "required": ["url"],
                 "additionalProperties": False,
@@ -1112,11 +1234,29 @@ def build_default_tool_registry(
 
     tools.register(
         ToolSpec(
+            name="check_tor_proxy",
+            description="Check whether the configured Tor SOCKS proxy works.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tor_socks_url": {"type": "string"},
+                    "timeout_sec": {"type": "integer", "minimum": 3, "maximum": 30},
+                },
+                "additionalProperties": False,
+            },
+            fn=lambda tor_socks_url="", timeout_sec=8: check_tor_proxy(
+                tor_socks_url=effective_tor_url(tor_socks_url),
+                timeout_sec=timeout_sec,
+            ),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
             name="search_web",
             description=(
-                "Search the web and return ranked results with titles, URLs, and snippets. "
-                "Normally uses the direct internet. If app config prefer_tor_for_web is true, "
-                "this automatically routes through Tor."
+                "Search the web and return ranked results. "
+                "If config prefer_tor_for_web is true, route through Tor."
             ),
             parameters={
                 "type": "object",
@@ -1147,20 +1287,14 @@ def build_default_tool_registry(
     tools.register(
         ToolSpec(
             name="search_tor",
-            description=(
-                "Search the web through the configured local Tor SOCKS proxy and return ranked results. "
-                "Use when the user explicitly requests Tor-routed search."
-            ),
+            description="Search the web through configured Tor SOCKS proxy.",
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
                     "timeout_sec": {"type": "integer", "minimum": 3, "maximum": 180},
-                    "tor_socks_url": {
-                        "type": "string",
-                        "description": "Optional override. Usually leave blank to use app config.",
-                    },
+                    "tor_socks_url": {"type": "string"},
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -1174,4 +1308,5 @@ def build_default_tool_registry(
         )
     )
 
+    _register_project_tools(tools, app_config)
     return tools
