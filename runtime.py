@@ -1,9 +1,14 @@
+# ========================================================
+# ================  runtime.py  ==========================
+# ========================================================
 from __future__ import annotations
 
+import base64
+import io
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, Generator, List
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from config import AppConfig
 from memory import MemoryStore
@@ -21,6 +26,281 @@ DISPLAY_TOOL_TRACE_RE = re.compile(r"(?is)\n---\n\n### Tool Trace\n\n.*$")
 DISPLAY_THINKING_ANSWER_RE = re.compile(
     r"(?is)^### Thinking\n\n.*?\n\n---\n\n### Answer\n\n(.*)$"
 )
+
+
+ATTACHMENT_BEGIN = "<<GPTPROJECT_ATTACHMENTS>>"
+ATTACHMENT_END = "<<END_GPTPROJECT_ATTACHMENTS>>"
+
+SUPPORTED_IMAGE_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff",
+}
+
+SUPPORTED_VIDEO_SUFFIXES = {
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".mpeg", ".mpg",
+}
+
+MAX_MEDIA_IMAGES_PER_MESSAGE = 12
+MAX_VIDEO_FRAMES_PER_FILE = 6
+MAX_MEDIA_DIMENSION = 1280
+MAX_MEDIA_BYTES = 80 * 1024 * 1024
+
+
+def _parse_attachment_blocks(text: str) -> List[Dict[str, str]]:
+    if ATTACHMENT_BEGIN not in (text or "") or ATTACHMENT_END not in (text or ""):
+        return []
+
+    _, _, remainder = text.partition(ATTACHMENT_BEGIN)
+    block, _, _ = remainder.partition(ATTACHMENT_END)
+
+    attachments: List[Dict[str, str]] = []
+
+    for raw_item in re.split(r"(?m)^=== FILE: ", block):
+        item = raw_item.strip()
+        if not item:
+            continue
+
+        if " ===" in item:
+            name, _, rest = item.partition(" ===")
+        else:
+            name, rest = "", item
+
+        data: Dict[str, str] = {"name": name.strip()}
+
+        for key in ("PATH", "KIND", "MIME", "SIZE_BYTES", "WARNING"):
+            m = re.search(rf"(?m)^{key}:\s*(.*)$", rest)
+            if m:
+                data[key.lower()] = (m.group(1) or "").strip()
+
+        if data.get("path"):
+            attachments.append(data)
+
+    return attachments
+
+
+def _strip_media_attachment_block_for_model(text: str) -> str:
+    """
+    Keep the user's visible text and text attachments, but reduce image/video
+    attachment bodies to short summaries. The actual visual data is sent through
+    Ollama's message.images field.
+    """
+    raw = text or ""
+    if ATTACHMENT_BEGIN not in raw or ATTACHMENT_END not in raw:
+        return raw
+
+    before, _, remainder = raw.partition(ATTACHMENT_BEGIN)
+    block, _, after = remainder.partition(ATTACHMENT_END)
+
+    rebuilt: List[str] = [before.strip(), "", ATTACHMENT_BEGIN]
+
+    for part in re.split(r"(?m)^=== FILE: ", block):
+        item = part.strip()
+        if not item:
+            continue
+
+        content = "=== FILE: " + item
+        kind_match = re.search(r"(?m)^KIND:\s*(.*)$", content)
+        kind = (kind_match.group(1).strip().lower() if kind_match else "")
+
+        if kind in {"image", "video"}:
+            name_match = re.search(r"(?m)^=== FILE:\s*(.*?)\s*===", content)
+            path_match = re.search(r"(?m)^PATH:\s*(.*)$", content)
+            mime_match = re.search(r"(?m)^MIME:\s*(.*)$", content)
+            size_match = re.search(r"(?m)^SIZE_BYTES:\s*(.*)$", content)
+
+            rebuilt.append(f"=== FILE: {(name_match.group(1).strip() if name_match else 'media')} ===")
+            if path_match:
+                rebuilt.append(f"PATH: {path_match.group(1).strip()}")
+            rebuilt.append(f"KIND: {kind}")
+            if mime_match:
+                rebuilt.append(f"MIME: {mime_match.group(1).strip()}")
+            if size_match:
+                rebuilt.append(f"SIZE_BYTES: {size_match.group(1).strip()}")
+            rebuilt.append("CONTENT:")
+            if kind == "image":
+                rebuilt.append("[Image is attached as model vision input.]")
+            else:
+                rebuilt.append("[Video is sampled into image frames and attached as model vision input.]")
+            rebuilt.append("=== END FILE ===")
+            rebuilt.append("")
+        else:
+            rebuilt.append(content)
+            if not content.endswith("\n"):
+                rebuilt.append("")
+
+    rebuilt.append(ATTACHMENT_END)
+    if after.strip():
+        rebuilt.append(after.strip())
+
+    return "\n".join(rebuilt).strip()
+
+
+def _file_size_ok(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size <= MAX_MEDIA_BYTES
+    except Exception:
+        return False
+
+
+def _image_file_to_base64(path: Path, max_dimension: int = MAX_MEDIA_DIMENSION) -> Optional[str]:
+    try:
+        if not _file_size_ok(path):
+            return None
+
+        try:
+            from PIL import Image, ImageOps
+        except Exception:
+            raw = path.read_bytes()
+            return base64.b64encode(raw).decode("ascii")
+
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode == "RGBA":
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.getchannel("A"))
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            if max(img.size) > max_dimension:
+                img.thumbnail((max_dimension, max_dimension))
+
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=90, optimize=True)
+            return base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _video_file_to_frame_base64(
+    path: Path,
+    max_frames: int = MAX_VIDEO_FRAMES_PER_FILE,
+    max_dimension: int = MAX_MEDIA_DIMENSION,
+) -> Tuple[List[str], str]:
+    """
+    Sample a small number of video frames and return them as JPEG base64 strings.
+    Requires opencv-python. This keeps Ollama-compatible vision input because
+    Ollama accepts images, not raw video blobs.
+    """
+    frames: List[str] = []
+
+    try:
+        if not _file_size_ok(path):
+            return [], "Video is missing or larger than the media byte limit."
+
+        try:
+            import cv2
+        except Exception:
+            return [], "opencv-python is not installed, so video frames could not be sampled."
+
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return [], "OpenCV could not open the video."
+
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if frame_count <= 0:
+            sample_indices = list(range(max_frames))
+        else:
+            if max_frames <= 1:
+                sample_indices = [max(0, frame_count // 2)]
+            else:
+                sample_indices = [
+                    int(round(i * (frame_count - 1) / float(max_frames - 1)))
+                    for i in range(max_frames)
+                ]
+
+        for idx in sample_indices:
+            if frame_count > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(idx, frame_count - 1)))
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+
+            h, w = frame.shape[:2]
+            largest = max(w, h)
+            if largest > max_dimension:
+                scale = max_dimension / float(largest)
+                frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))))
+
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                continue
+
+            frames.append(base64.b64encode(encoded.tobytes()).decode("ascii"))
+
+        cap.release()
+
+        if not frames:
+            return [], "No frames could be sampled from the video."
+
+        return frames, f"Sampled {len(frames)} frame(s) from video."
+    except Exception as exc:
+        return frames, f"Video frame sampling failed: {exc}"
+
+
+def _extract_model_images_from_payload(text: str) -> Tuple[List[str], List[str]]:
+    images: List[str] = []
+    notes: List[str] = []
+
+    for item in _parse_attachment_blocks(text):
+        if len(images) >= MAX_MEDIA_IMAGES_PER_MESSAGE:
+            break
+
+        path_text = item.get("path", "")
+        kind = (item.get("kind", "") or "").strip().lower()
+        path = Path(path_text).expanduser()
+
+        if not path.exists():
+            notes.append(f"{item.get('name', path.name)}: file missing at send time.")
+            continue
+
+        suffix = path.suffix.lower()
+        if not kind:
+            if suffix in SUPPORTED_IMAGE_SUFFIXES:
+                kind = "image"
+            elif suffix in SUPPORTED_VIDEO_SUFFIXES:
+                kind = "video"
+
+        if kind == "image" or suffix in SUPPORTED_IMAGE_SUFFIXES:
+            encoded = _image_file_to_base64(path)
+            if encoded:
+                images.append(encoded)
+                notes.append(f"{item.get('name', path.name)}: attached as image input.")
+            else:
+                notes.append(f"{item.get('name', path.name)}: image could not be encoded.")
+            continue
+
+        if kind == "video" or suffix in SUPPORTED_VIDEO_SUFFIXES:
+            remaining = MAX_MEDIA_IMAGES_PER_MESSAGE - len(images)
+            frame_count = max(1, min(MAX_VIDEO_FRAMES_PER_FILE, remaining))
+            frame_images, note = _video_file_to_frame_base64(path, max_frames=frame_count)
+            images.extend(frame_images[:remaining])
+            notes.append(f"{item.get('name', path.name)}: {note}")
+            continue
+
+    return images[:MAX_MEDIA_IMAGES_PER_MESSAGE], notes
+
+
+def _message_content_and_images_for_model(
+    role: str,
+    content: str,
+    *,
+    include_media: bool,
+) -> Dict[str, Any]:
+    model_content = _strip_media_attachment_block_for_model(content)
+    msg: Dict[str, Any] = {"role": role, "content": model_content}
+
+    if include_media and role == "user":
+        images, notes = _extract_model_images_from_payload(content)
+        if images:
+            msg["images"] = images
+
+        if notes:
+            extra = "\n\nMedia processing notes:\n" + "\n".join(f"- {n}" for n in notes)
+            msg["content"] = (msg.get("content", "") or "").strip() + extra
+
+    return msg
+
 
 
 def _safe_json_dumps(obj: Any) -> str:
@@ -158,7 +438,11 @@ def _strip_display_metadata_for_history(text: str) -> str:
     return s.strip()
 
 
-def _format_tool_trace(tool_trace: List[Dict[str, Any]]) -> str:
+def _format_tool_trace(
+    tool_trace: List[Dict[str, Any]],
+    *,
+    max_tool_trace_result_chars: int = MAX_TOOL_TRACE_RESULT_CHARS,
+) -> str:
     if not tool_trace:
         return ""
 
@@ -172,7 +456,7 @@ def _format_tool_trace(tool_trace: List[Dict[str, Any]]) -> str:
         parts.append(
             f"{idx}. `{name}`\n"
             f"   args: `{_clip_text(_safe_json_dumps(arguments), 600)}`\n"
-            f"   result: `{_clip_text(result, MAX_TOOL_TRACE_RESULT_CHARS)}`"
+            f"   result: `{_clip_text(result, max_tool_trace_result_chars)}`"
         )
 
     return "\n\n".join(parts).strip()
@@ -185,6 +469,7 @@ def _format_display_response(
     tool_trace: List[Dict[str, Any]],
     show_thinking: bool,
     show_tool_trace: bool,
+    max_tool_trace_result_chars: int = MAX_TOOL_TRACE_RESULT_CHARS,
 ) -> str:
     final_answer = (answer or "").strip() or "Model failed to produce a response."
     thinking_text = (thinking or "").strip()
@@ -203,7 +488,10 @@ def _format_display_response(
         sections.append(final_answer)
 
     if show_tool_trace and tool_trace:
-        trace = _format_tool_trace(tool_trace)
+        trace = _format_tool_trace(
+            tool_trace,
+            max_tool_trace_result_chars=max_tool_trace_result_chars,
+        )
         if trace:
             sections.append("---\n\n### Tool Trace\n\n" + trace)
 
@@ -213,23 +501,33 @@ def _format_display_response(
 def load_system_prompt(prompt_path: str) -> str:
     path = Path(prompt_path)
 
-    default_prompt = """You are a practical local assistant.
+    default_prompt = """You are a practical local coding assistant.
 
-Rules:
+Core rules:
 - Be helpful and direct.
 - Use tools when they clearly help produce a better answer.
 - Never invent tool results.
 - When a tool fails, say so briefly and keep helping if possible.
 - You may use multiple tool calls when needed.
-- Prefer local tools first when they can answer the question.
+- Prefer local project tools first when the user asks about their code/project.
 - For web questions, search first, then summarize accurately.
 - Return a normal final answer after tools complete.
 
+Local project tool rules:
+- If the user asks about this local codebase, project files, imports, errors, tests, syntax, runtime failures, or requested patches, use the project tools.
+- Start with project_status before project scanning or running commands.
+- Use project_tree to inspect the file layout.
+- Use search_project to locate relevant files/classes/functions/errors.
+- Use read_project_file before making claims about exact code.
+- Use run_project_command for safe diagnostics such as py_compile, pytest, ruff, mypy, or pyright.
+- Do not claim a command passed unless the tool result says it passed.
+- If write_project_file is disabled, provide copy/paste patches instead of pretending to edit files.
+- If write_project_file is enabled, only write files the user clearly asked to change.
+
 Thinking display rules:
-- If the model supports a visible thinking channel, use it naturally.
-- If the model uses <think>...</think> tags, put visible reasoning inside <think>...</think>.
+- If the model supports a visible thinking field, keep it concise and useful.
+- If the model uses <think>...</think> tags, put brief useful reasoning inside <think>...</think>.
 - After thinking, provide the final answer normally.
-- Keep visible thinking concise and useful.
 - Never invent tool results inside thinking or final answers.
 
 Tor/tool rules:
@@ -265,6 +563,9 @@ class AssistantRuntime:
         show_thinking: bool = True,
         show_tool_trace: bool = False,
         stream_chat: bool = True,
+        max_tool_rounds: int = MAX_TOOL_ROUNDS,
+        max_tool_result_chars: int = MAX_TOOL_RESULT_CHARS,
+        max_tool_trace_result_chars: int = MAX_TOOL_TRACE_RESULT_CHARS,
     ) -> None:
         self.provider = provider
         self.tools = tools
@@ -275,27 +576,48 @@ class AssistantRuntime:
         self.show_thinking = bool(show_thinking)
         self.show_tool_trace = bool(show_tool_trace)
         self.stream_chat = bool(stream_chat)
+        self.max_tool_rounds = max(1, int(max_tool_rounds))
+        self.max_tool_result_chars = max(100, int(max_tool_result_chars))
+        self.max_tool_trace_result_chars = max(50, int(max_tool_trace_result_chars))
 
     def _build_messages_from_memory(self, session_id: str) -> List[Dict[str, Any]]:
         history = self.memory.recent_messages(session_id, limit=self.max_history)
 
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt}
+            {
+                "role": "system",
+                "content": (
+                    self.system_prompt
+                    + "\n\nMedia attachment rules:\n"
+                    "- When the latest user message includes images, they are supplied in Ollama's message.images field.\n"
+                    "- When the latest user message includes video, sampled frames are supplied as images.\n"
+                    "- Use the attached visual inputs directly when answering.\n"
+                    "- If no images arrive, say the selected model may not support vision or the media could not be encoded."
+                ),
+            }
         ]
 
-        for item in history:
+        last_user_index = -1
+        for idx, item in enumerate(history):
+            if item.get("role", "") == "user":
+                last_user_index = idx
+
+        for idx, item in enumerate(history):
             role = item.get("role", "")
             content = item.get("content", "")
 
             if role == "assistant":
                 content = _strip_display_metadata_for_history(content)
 
-            messages.append(
-                {
-                    "role": role,
-                    "content": content,
-                }
-            )
+            if role in {"system", "user", "assistant", "tool"}:
+                include_media = role == "user" and idx == last_user_index
+                messages.append(
+                    _message_content_and_images_for_model(
+                        role,
+                        content,
+                        include_media=include_media,
+                    )
+                )
 
         return messages
 
@@ -308,9 +630,9 @@ class AssistantRuntime:
         raw = self.tools.call(name, arguments)
         try:
             parsed = json.loads(raw)
-            return _clip_text(_safe_json_dumps(parsed))
+            return _clip_text(_safe_json_dumps(parsed), self.max_tool_result_chars)
         except Exception:
-            return _clip_text(raw)
+            return _clip_text(raw, self.max_tool_result_chars)
 
     def ask(self, session_id: str, user_text: str) -> str:
         final_text = ""
@@ -339,7 +661,16 @@ class AssistantRuntime:
         full_answer = ""
         tool_trace: List[Dict[str, Any]] = []
 
-        for round_idx in range(MAX_TOOL_ROUNDS):
+        if not tool_schemas:
+            yield {
+                "type": "status",
+                "text": (
+                    "No tools are registered. Check GPTPROJECT_LOCAL_PROJECT_DIR "
+                    "and GPTPROJECT_PROJECT_TOOLS_ENABLED."
+                ),
+            }
+
+        for round_idx in range(self.max_tool_rounds):
             yield {
                 "type": "status",
                 "text": f"Streaming from Ollama... round {round_idx + 1}",
@@ -445,6 +776,9 @@ class AssistantRuntime:
                     name = fn.get("name", "")
                     arguments = fn.get("arguments", {}) or {}
 
+                    if not name:
+                        continue
+
                     yield {
                         "type": "status",
                         "text": f"Calling tool: {name}",
@@ -483,6 +817,7 @@ class AssistantRuntime:
                 tool_trace=tool_trace,
                 show_thinking=self.show_thinking,
                 show_tool_trace=self.show_tool_trace,
+                max_tool_trace_result_chars=self.max_tool_trace_result_chars,
             )
 
             stored = self._store_and_return(session_id, display)
@@ -548,12 +883,21 @@ class AssistantRuntime:
 
 
 def _build_tools_for_config(cfg: AppConfig) -> ToolRegistry:
+    """
+    IMPORTANT FIX:
+    Pass app_config=cfg into build_default_tool_registry.
+
+    Without this, tools.py receives app_config=None, so _register_project_tools()
+    returns early and none of the local project tools are exposed to the model.
+    """
     try:
         return build_default_tool_registry(
             tor_socks_url=cfg.tor_socks_url,
             prefer_tor_for_web=cfg.prefer_tor_for_web,
+            app_config=cfg,
         )
     except TypeError:
+        # Backward compatibility for older tools.py versions.
         return build_default_tool_registry()
 
 
@@ -581,4 +925,7 @@ def build_runtime(config: AppConfig | None = None) -> AssistantRuntime:
         show_thinking=cfg.show_thinking,
         show_tool_trace=cfg.show_tool_trace,
         stream_chat=cfg.stream_chat,
+        max_tool_rounds=cfg.max_tool_rounds,
+        max_tool_result_chars=cfg.max_tool_result_chars,
+        max_tool_trace_result_chars=cfg.max_tool_trace_result_chars,
     )

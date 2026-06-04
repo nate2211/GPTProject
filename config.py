@@ -29,7 +29,11 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
     return default
 
 
@@ -62,12 +66,19 @@ class AppConfig:
     window_width: int = int(os.getenv("GPTPROJECT_WINDOW_WIDTH", "1280"))
     window_height: int = int(os.getenv("GPTPROJECT_WINDOW_HEIGHT", "840"))
 
-    # Tor support.
-    # Tor Browser: socks5h://127.0.0.1:9150
-    # Tor daemon:  socks5h://127.0.0.1:9050
-    tor_socks_url: str = os.getenv(
-        "GPTPROJECT_TOR_SOCKS_URL",
-        "socks5h://127.0.0.1:9150",
+    # Tor / interactive browser support.
+    # Tor Browser tor.exe is usually:
+    #   C:\\...\\Tor Browser\\Browser\\TorBrowser\\Tor\\tor.exe
+    # Tor Browser SOCKS default: socks5h://127.0.0.1:9150
+    # Tor daemon SOCKS default:  socks5h://127.0.0.1:9050
+    tor_socks_url: str = os.getenv("GPTPROJECT_TOR_SOCKS_URL", "socks5h://127.0.0.1:9150")
+    tor_exe_path: str = os.getenv("GPTPROJECT_TOR_EXE_PATH", "")
+    tor_auto_start: bool = _env_bool("GPTPROJECT_TOR_AUTO_START", True)
+    tor_data_dir: str = os.getenv("GPTPROJECT_TOR_DATA_DIR", "data/tor")
+    tor_start_timeout_sec: int = int(os.getenv("GPTPROJECT_TOR_START_TIMEOUT_SEC", "45"))
+    interactive_browser_data_dir: str = os.getenv(
+        "GPTPROJECT_INTERACTIVE_BROWSER_DATA_DIR",
+        "data/interactive_browser",
     )
     prefer_tor_for_web: bool = _env_bool("GPTPROJECT_PREFER_TOR_FOR_WEB", False)
 
@@ -76,9 +87,19 @@ class AppConfig:
     show_tool_trace: bool = _env_bool("GPTPROJECT_SHOW_TOOL_TRACE", False)
     stream_chat: bool = _env_bool("GPTPROJECT_STREAM_CHAT", True)
 
+    # Chat scroll behavior. Default: scroll once when sending, but do not keep
+    # dragging the user to the bottom while the assistant is streaming.
+    chat_autoscroll_on_send: bool = _env_bool("GPTPROJECT_CHAT_AUTOSCROLL_ON_SEND", True)
+    chat_autoscroll_during_stream: bool = _env_bool("GPTPROJECT_CHAT_AUTOSCROLL_DURING_STREAM", False)
+
+    # Runtime tool-call limits. These are editable in the GUI.
+    max_tool_rounds: int = int(os.getenv("GPTPROJECT_MAX_TOOL_ROUNDS", "6"))
+    max_tool_result_chars: int = int(os.getenv("GPTPROJECT_MAX_TOOL_RESULT_CHARS", "5000"))
+    max_tool_trace_result_chars: int = int(os.getenv("GPTPROJECT_MAX_TOOL_TRACE_RESULT_CHARS", "900"))
+
     # Local Python project scanning/running support.
     # Example:
-    # GPTPROJECT_LOCAL_PROJECT_DIR=X:\Users\natem\PycharmProjects\ChatProject
+    # GPTPROJECT_LOCAL_PROJECT_DIR=X:\\Users\\natem\\PycharmProjects\\ChatProject
     local_project_dir: str = os.getenv("GPTPROJECT_LOCAL_PROJECT_DIR", "")
 
     # Register project tools for the GPT runtime.
@@ -116,6 +137,24 @@ class AppConfig:
     @property
     def settings_file(self) -> Path:
         return Path(self.settings_path)
+
+    @property
+    def tor_exe_file(self) -> Path | None:
+        raw = (self.tor_exe_path or "").strip().strip('"')
+        if not raw:
+            return None
+        try:
+            return Path(raw).expanduser().resolve()
+        except Exception:
+            return None
+
+    @property
+    def tor_data_directory(self) -> Path:
+        return Path(self.tor_data_dir or "data/tor").expanduser()
+
+    @property
+    def interactive_browser_directory(self) -> Path:
+        return Path(self.interactive_browser_data_dir or "data/interactive_browser").expanduser()
 
     @property
     def resolved_project_dir(self) -> Path | None:
@@ -191,9 +230,12 @@ class AppConfig:
 
         bool_keys = {
             "prefer_tor_for_web",
+            "tor_auto_start",
             "show_thinking",
             "show_tool_trace",
             "stream_chat",
+            "chat_autoscroll_on_send",
+            "chat_autoscroll_during_stream",
             "project_tools_enabled",
             "project_run_enabled",
             "project_write_enabled",
@@ -204,6 +246,10 @@ class AppConfig:
             "request_timeout_sec",
             "window_width",
             "window_height",
+            "tor_start_timeout_sec",
+            "max_tool_rounds",
+            "max_tool_result_chars",
+            "max_tool_trace_result_chars",
             "project_command_timeout_sec",
             "project_max_output_chars",
             "project_max_file_chars",

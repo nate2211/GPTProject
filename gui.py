@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import mimetypes
 import re
 import sys
 from dataclasses import dataclass
@@ -57,6 +58,12 @@ try:
     from provider_local import discover_ollama_models as _discover_ollama_models
 except Exception:
     _discover_ollama_models = None
+
+
+try:
+    from loggers import DEBUG_LOGGER
+except Exception:
+    DEBUG_LOGGER = None
 
 
 DARK_STYLESHEET = """
@@ -162,6 +169,16 @@ SUPPORTED_TEXT_SUFFIXES = {
     ".kt", ".go", ".rs", ".php", ".rb", ".lua", ".swift", ".dart", ".toml",
 }
 
+SUPPORTED_IMAGE_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff",
+}
+
+SUPPORTED_VIDEO_SUFFIXES = {
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".mpeg", ".mpg",
+}
+
+MEDIA_ATTACHMENT_SUFFIXES = SUPPORTED_IMAGE_SUFFIXES | SUPPORTED_VIDEO_SUFFIXES
+
 MAX_FILE_CHARS = 120_000
 MAX_TOTAL_ATTACHMENT_CHARS = 350_000
 
@@ -232,6 +249,9 @@ class AttachmentPayload:
     name: str
     content: str
     warning: str = ""
+    kind: str = "text"
+    mime_type: str = "text/plain"
+    size_bytes: int = 0
 
 
 def _cfg_get(config: AppConfig, name: str, default):
@@ -296,6 +316,16 @@ def _apply_compact_repair_table(text: str) -> str:
 
 
 def repair_compacted_thinking_text(text: str) -> str:
+    """
+    Display-only repair for compacted model thinking text.
+
+    Some local/Ollama-style streams can arrive without normal word spacing, e.g.:
+        The user wantsmeto:1.Openaninteractive Torbrowsersession
+
+    This keeps the original answer content intact, but makes the visible
+    Thinking panel readable by restoring obvious spaces, numbered steps,
+    sentence breaks, and tool-parameter lines.
+    """
     raw = text or ""
     if not raw.strip():
         return ""
@@ -304,32 +334,138 @@ def repair_compacted_thinking_text(text: str) -> str:
     out = out.replace("\u200b", "").replace("\ufeff", "")
     out = re.sub(r"[ \t\f\v]+", " ", out)
 
+    protected_tokens = {
+        "open_user_session": "__OPEN_USER_SESSION__",
+        "allow_read": "__ALLOW_READ__",
+        "timeout_sec": "__TIMEOUT_SEC__",
+        "interactive_tor": "__INTERACTIVE_TOR__",
+        "interactive_search": "__INTERACTIVE_SEARCH__",
+        "project_status": "__PROJECT_STATUS__",
+        "project_tree": "__PROJECT_TREE__",
+        "ask_stream": "__ASK_STREAM__",
+        "tool_result": "__TOOL_RESULT__",
+    }
+
+    for token, marker in protected_tokens.items():
+        out = out.replace(token, marker)
+
+    local_repairs = {
+        "Theuserwantsmeto": "The user wants me to",
+        "Theuserwantsme": "The user wants me",
+        "theuserwantsmeto": "the user wants me to",
+        "theuserwantsme": "the user wants me",
+        "wantsmeto": "wants me to",
+        "wantsme": "wants me",
+        "Openaninteractive": "Open an interactive",
+        "openaninteractive": "open an interactive",
+        "Torbrowsersession": "Tor browser session",
+        "torbrowsersession": "Tor browser session",
+        "Torsession": "Tor session",
+        "torsession": "Tor session",
+        "Setalongtimeout": "Set a long timeout",
+        "setalongtimeout": "set a long timeout",
+        "whenopening": "when opening",
+        "timeoutwhenopening": "timeout when opening",
+        "timefor": "time for",
+        "untilthey": "until they",
+        "itintheir": "it in their",
+        "intheir": "in their",
+        "opentheinteractive": "open the interactive",
+        "theinteractive": "the interactive",
+        "sessionwith": "session with",
+        "valuelike": "value like",
+        "longerfor": "longer for",
+        "safetyparams": "safety\n- params",
+        "trueso": "true so",
+        "Icanreadwhat'sonscreenafteruserinteraction": "I can read what's on screen after user interaction",
+        "Icanreadwhat": "I can read what",
+        "onscreen": "on screen",
+        "afteruserinteraction": "after user interaction",
+        "useinteractive_torwithopen_user_sessionaction": "use interactive_tor with open_user_session action",
+        "useinteractive_tor": "use interactive_tor",
+        "wantenoughtime": "want enough time",
+        "enoughtime": "enough time",
+        "forbrowsing": "for browsing",
+        "Waituntil": "Wait until",
+        "waituntil": "wait until",
+        "theymanuallycloseit": "they manually close it",
+        "theymanuallyclose": "they manually close",
+        "manuallyclose": "manually close",
+        "visiblebrowserwindow": "visible browser window",
+        "theirvisible": "their visible",
+        "Aftertheyclosethesession": "After they close the session",
+        "Aftertheyclose": "After they close",
+        "aftertheyclose": "after they close",
+        "thesession": "the session",
+        "continuewithwhateverresponse": "continue with whatever response",
+        "continuewithwhatever": "continue with whatever",
+        "continuewith": "continue with",
+        "response/taskweneed": "response/task we need",
+        "taskweneed": "task we need",
+        "Letmeopen": "Let me open",
+        "letmeopen": "let me open",
+        "appropriateparameters": "appropriate parameters",
+        "allowread": "allow_read",
+        "Alongtimeout": "A long timeout",
+        "Alongvalue": "A long value",
+        "like3600": "like 3600",
+        "orevenlonger": "or even longer",
+        "forsafety": "for safety",
+        "paramsshouldincludesettings": "params should include settings",
+        "paramsshouldinclude": "params should include",
+        "settingsforthe": "settings for the",
+        "Torbrowser": "Tor browser",
+        "I'lluse": "I'll use",
+        "Iwilluse": "I will use",
+        "withopen_user_sessionaction": "with open_user_session action",
+        "Tor browser I'll": "Tor browser.\n\nI'll",
+        "withappropriateparameters": "with appropriate parameters",
+        "sothe": "so the",
+        "wontmove": "won't move",
+        "nexttool": "next tool",
+        "tillafter": "till after",
+        "afterclosing": "after closing",
+        "cookieslink": "cookies link",
+        "sessionable": "session able",
+        "usedbythegpt": "used by the GPT",
+    }
+
+    out = _apply_compact_repair_table(out)
+    for before, after in sorted(local_repairs.items(), key=lambda pair: len(pair[0]), reverse=True):
+        out = out.replace(before, after)
+
     compact_score = 0
     if len(out) > 80:
         whitespace_count = len(re.findall(r"\s", out))
-        if whitespace_count < max(3, len(out) // 45):
+        if whitespace_count < max(3, len(out) // 35):
             compact_score += 1
 
     if re.search(
-        r"(Theuser|userwants|WhatsAppandTelegram|Telegramcommunities|Letmesearch|foreachcategory)",
+        r"(Theuser|theuser|userwants|wantsmeto|Letme|Openaninteractive|Torbrowsersession|Setalongtimeout|Waituntil|Aftertheyclose)",
         out,
     ):
         compact_score += 2
-
-    out = _apply_compact_repair_table(out)
 
     if compact_score:
         out = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", out)
         out = re.sub(r"(?<=[A-Za-z])(?=\d+[.)])", "\n", out)
         out = re.sub(r"(?<=[0-9])(?=[A-Za-z])", " ", out)
 
+    for token, marker in protected_tokens.items():
+        out = out.replace(marker, token)
+
     brand_repairs = {
         "Whats App": "WhatsApp",
         "Whats app": "WhatsApp",
         "Tele Gram": "Telegram",
         "Tele gram": "Telegram",
+        "Tor Browser": "Tor browser",
         "Tor Search": "Tor search",
         "T Or": "Tor",
+        "G Pt": "GPT",
+        "G P T": "GPT",
+        "Py Qt": "PyQt",
+        "Olla Ma": "Ollama",
     }
     for before, after in brand_repairs.items():
         out = out.replace(before, after)
@@ -339,14 +475,41 @@ def repair_compacted_thinking_text(text: str) -> str:
     out = re.sub(r":\s*(?=\d+[.)])", ":\n", out)
     out = re.sub(r"(?<!\n)(?=\b\d+[.)]\s*)", "\n", out)
     out = re.sub(r"\b(\d+)[.)]\s*", r"\1. ", out)
-    out = re.sub(r"([.!?])\s*(?=[A-Z])", r"\1\n", out)
+    out = re.sub(r"\s+-\s*", "\n- ", out)
+
+    out = re.sub(r"(?<!\n)\b(action|allow_read|timeout_sec|params|url|depth|title)\s*:", r"\n- \1:", out)
+    out = re.sub(r",\s*(?=(action|allow_read|timeout_sec|params|url|depth|title)\s*:)", "\n", out)
+
+    out = re.sub(r"(?<!\d)([.!?])\s*(?=[A-Z])", r"\1\n", out)
     out = re.sub(r"([.!?])\s*(?=I['’]ll\b)", r"\1\n", out)
+    out = re.sub(r";\s*", ";\n", out)
     out = re.sub(r"([,;:])(?=\S)", r"\1 ", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
+
     out = re.sub(r"[ \t]+\n", "\n", out)
     out = re.sub(r"\n[ \t]+", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    out = re.sub(r"\n-\s*\n", "\n", out)
 
-    out = _apply_compact_repair_table(out)
+    final_repairs = {
+        "we need Let me": "we need.\n\nLet me",
+        "opening(": "opening (",
+        "3600(1 hour)or": "3600 (1 hour) or",
+        "for safety-params": "for safety\n- params",
+        "for safety- params": "for safety\n- params",
+        "after user interaction-": "after user interaction",
+        "I'lluseinteractive_torwithopen_user_sessionaction": "I'll use interactive_tor with open_user_session action",
+        "I'll useinteractive_torwithopen_user_sessionaction": "I'll use interactive_tor with open_user_session action",
+        "useinteractive_torwithopen_user_sessionaction": "use interactive_tor with open_user_session action",
+        "withopen_user_sessionaction": "with open_user_session action",
+        "Tor browser I'll": "Tor browser.\n\nI'll",
+    }
+    for before, after in final_repairs.items():
+        out = out.replace(before, after)
+
+    out = re.sub(r"interaction\s*-\s*\n-\s*timeout_sec", "interaction\n- timeout_sec", out)
+    out = re.sub(r"safety\s*-\s*params", "safety\n- params", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+
     return out.strip()
 
 
@@ -393,10 +556,31 @@ def build_message_payload(user_text: str, attachments: list[AttachmentPayload]) 
     for attachment in attachments:
         parts.append(f"=== FILE: {attachment.name} ===")
         parts.append(f"PATH: {attachment.path}")
+        parts.append(f"KIND: {attachment.kind}")
+        parts.append(f"MIME: {attachment.mime_type}")
+        parts.append(f"SIZE_BYTES: {attachment.size_bytes}")
         if attachment.warning:
             parts.append(f"WARNING: {attachment.warning}")
-        parts.append("CONTENT:")
-        parts.append(attachment.content)
+
+        if attachment.kind == "text":
+            parts.append("CONTENT:")
+            parts.append(attachment.content)
+        elif attachment.kind == "image":
+            parts.append("CONTENT:")
+            parts.append(
+                "[Image attachment. The runtime will load this file path and send it to the model "
+                "as an Ollama vision image input when the selected model supports vision.]"
+            )
+        elif attachment.kind == "video":
+            parts.append("CONTENT:")
+            parts.append(
+                "[Video attachment. The runtime will sample frames from this file path and send "
+                "those frames to the model as Ollama vision image inputs when possible.]"
+            )
+        else:
+            parts.append("CONTENT:")
+            parts.append(attachment.content or "[Binary attachment metadata only.]")
+
         parts.append("=== END FILE ===")
         parts.append("")
     parts.append(ATTACHMENT_END)
@@ -413,6 +597,27 @@ def extract_display_text_and_files(raw_text: str) -> tuple[str, list[str]]:
     return before.strip(), files
 
 
+def _guess_attachment_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in SUPPORTED_IMAGE_SUFFIXES:
+        return "image"
+    if suffix in SUPPORTED_VIDEO_SUFFIXES:
+        return "video"
+    if suffix in SUPPORTED_TEXT_SUFFIXES:
+        return "text"
+
+    guessed, _ = mimetypes.guess_type(str(path))
+    if guessed:
+        if guessed.startswith("image/"):
+            return "image"
+        if guessed.startswith("video/"):
+            return "video"
+        if guessed.startswith("text/"):
+            return "text"
+
+    return "binary"
+
+
 def read_attachment_file(path_str: str) -> AttachmentPayload:
     path = Path(path_str)
     warning = ""
@@ -423,11 +628,61 @@ def read_attachment_file(path_str: str) -> AttachmentPayload:
             name=path.name or str(path),
             content="[File could not be found at send time.]",
             warning="Missing file",
+            kind="missing",
+            mime_type="application/octet-stream",
+            size_bytes=0,
+        )
+
+    if not path.is_file():
+        return AttachmentPayload(
+            path=str(path),
+            name=path.name or str(path),
+            content="[Attachment path is not a file.]",
+            warning="Not a file",
+            kind="binary",
+            mime_type="application/octet-stream",
+            size_bytes=0,
         )
 
     suffix = path.suffix.lower()
-    if suffix and suffix not in SUPPORTED_TEXT_SUFFIXES:
-        warning = f"Extension {suffix} is not in the text/code allowlist; attempting text read anyway."
+    kind = _guess_attachment_kind(path)
+    mime_type = mimetypes.guess_type(str(path))[0] or (
+        "image/*" if kind == "image" else "video/*" if kind == "video" else "text/plain" if kind == "text" else "application/octet-stream"
+    )
+
+    try:
+        size_bytes = path.stat().st_size
+    except Exception:
+        size_bytes = 0
+
+    if kind in {"image", "video"}:
+        if kind == "video":
+            warning = (
+                "Video will be sampled into frames by runtime. "
+                "Install opencv-python for best support."
+            )
+
+        return AttachmentPayload(
+            path=str(path.resolve()),
+            name=path.name,
+            content=f"[{kind.title()} attachment: {path.name}, {size_bytes} bytes]",
+            warning=warning,
+            kind=kind,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+        )
+
+    if kind != "text":
+        warning = f"Extension {suffix or '(none)'} is not text/image/video; sending metadata only."
+        return AttachmentPayload(
+            path=str(path.resolve()),
+            name=path.name,
+            content="[Binary attachment metadata only. This file was not decoded into the prompt.]",
+            warning=warning,
+            kind="binary",
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+        )
 
     raw = path.read_bytes()
     decoded = raw.decode("utf-8", errors="replace")
@@ -441,11 +696,91 @@ def read_attachment_file(path_str: str) -> AttachmentPayload:
         name=path.name,
         content=decoded,
         warning=warning,
+        kind="text",
+        mime_type=mime_type,
+        size_bytes=size_bytes,
     )
 
 
 def _text_to_html(text: str) -> str:
-    return html.escape(text or "").replace("\n", "<br>")
+    return html.escape(text or "")
+
+
+def _looks_like_numbered_line(line: str) -> bool:
+    return bool(re.match(r"^\s*\d+[.)]\s+", line or ""))
+
+
+def _looks_like_bullet_line(line: str) -> bool:
+    return bool(re.match(r"^\s*[-*•]\s+", line or ""))
+
+
+def _render_readable_plain_html(text: str, text_color: str = "#f8fafc") -> str:
+    """
+    Render plain text as readable paragraphs/list rows instead of one dense div.
+    QTextBrowser supports enough HTML/CSS for div-based paragraph spacing to work
+    more reliably than relying on repeated <br> tags.
+    """
+    parts: list[str] = []
+    pending_paragraph: list[str] = []
+
+    def flush_paragraph() -> None:
+        if not pending_paragraph:
+            return
+        paragraph = " ".join(line.strip() for line in pending_paragraph if line.strip())
+        pending_paragraph.clear()
+        if not paragraph.strip():
+            return
+        parts.append(
+            f"""
+            <div style="
+                color:{text_color};
+                line-height:1.65;
+                margin:0 0 9px 0;
+                white-space:normal;
+            ">{html.escape(paragraph)}</div>
+            """
+        )
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            flush_paragraph()
+            parts.append('<div style="height:4px;"></div>')
+            continue
+
+        if _looks_like_numbered_line(line) or _looks_like_bullet_line(line):
+            flush_paragraph()
+            parts.append(
+                f"""
+                <div style="
+                    color:{text_color};
+                    line-height:1.65;
+                    margin:3px 0 3px 18px;
+                    white-space:normal;
+                ">{html.escape(line)}</div>
+                """
+            )
+            continue
+
+        if re.match(r"^\s*(action|allow_read|timeout_sec|params|url|depth|title)\s*:", line):
+            flush_paragraph()
+            parts.append(
+                f"""
+                <div style="
+                    color:{text_color};
+                    line-height:1.55;
+                    margin:3px 0 3px 18px;
+                    white-space:normal;
+                ">- {html.escape(line)}</div>
+                """
+            )
+            continue
+
+        pending_paragraph.append(line)
+
+    flush_paragraph()
+    return "".join(parts)
 
 
 def _render_text_and_code_chunks(
@@ -462,13 +797,7 @@ def _render_text_and_code_chunks(
             if not normalized.strip():
                 continue
 
-            parts.append(
-                f"""
-                <div style="color:{text_color}; line-height:1.55; margin-bottom:8px; white-space:normal;">
-                    {_text_to_html(normalized)}
-                </div>
-                """
-            )
+            parts.append(_render_readable_plain_html(normalized, text_color=text_color))
         else:
             lang = html.escape(language or "code")
             code_html = html.escape(chunk)
@@ -476,7 +805,7 @@ def _render_text_and_code_chunks(
             parts.append(
                 f"""
                 <div style="
-                    margin:8px 0;
+                    margin:10px 0;
                     background:#020617;
                     border:1px solid #334155;
                     border-radius:12px;
@@ -491,12 +820,13 @@ def _render_text_and_code_chunks(
                     ">{lang}</div>
                     <pre style="
                         margin:0;
-                        padding:10px 12px;
+                        padding:12px 14px;
                         color:#e2e8f0;
                         white-space:pre-wrap;
                         word-wrap:break-word;
                         font-family:Consolas, 'Courier New', monospace;
                         font-size:12px;
+                        line-height:1.55;
                     ">{code_html}</pre>
                 </div>
                 """
@@ -555,19 +885,19 @@ def _render_thinking_panel(thinking: str) -> str:
         background:#111827;
         border:1px solid #475569;
         border-radius:12px;
-        padding:10px 12px;
-        margin:4px 0 10px 0;
+        padding:12px 14px;
+        margin:4px 0 12px 0;
     ">
         <div style="
             color:#fbbf24;
             font-size:12px;
             font-weight:800;
             letter-spacing:0.3px;
-            margin-bottom:8px;
+            margin-bottom:10px;
         ">Thinking</div>
         <div style="
             color:#cbd5e1;
-            line-height:1.55;
+            line-height:1.65;
             font-size:12px;
         ">
             {_render_text_and_code_chunks(repaired, text_color="#cbd5e1", thinking=True)}
@@ -622,8 +952,8 @@ def _format_live_assistant_text(
     show_tool_trace: bool,
 ) -> str:
     repaired_thinking = repair_compacted_thinking_text(thinking or "")
-    answer = answer or ""
-    status = status or ""
+    answer = normalize_plain_text(answer or "")
+    status = normalize_plain_text(status or "")
 
     parts: list[str] = []
 
@@ -639,7 +969,11 @@ def _format_live_assistant_text(
         parts.append(answer.strip() or "...")
 
     if show_tool_trace and status.strip():
-        parts.append(f"\n\n---\n\n### Tool Trace\n\n{status.strip()}")
+        parts.append(
+            "\n\n---\n\n"
+            "### Tool Trace\n\n"
+            f"{status.strip()}"
+        )
 
     return "\n".join(parts).strip()
 
@@ -711,6 +1045,16 @@ def _message_to_html(speaker: str, raw_text: str, mine: bool, subtle: bool = Fal
 
     parts.append("</div></div>")
     return "".join(parts)
+
+
+class DebugLogBridge(QObject):
+    """
+    Tiny Qt bridge for loggers.DEBUG_LOGGER.
+
+    DebugLogger can be called from worker/background threads. Emitting this
+    signal moves the append into the GUI thread before touching widgets.
+    """
+    message = pyqtSignal(str)
 
 
 class ChatWorker(QObject):
@@ -802,6 +1146,13 @@ class MainWindow(QMainWindow):
         self._pending_render_force_bottom = False
         self._pending_render_preserve_scroll = True
 
+        # Streaming scroll policy:
+        # - On send/session load the chat can jump to the bottom once.
+        # - While GPT is thinking/writing, every re-render preserves the user's
+        #   current scrollbar value exactly.
+        # - The scrollbar only moves after that when the user moves it.
+        self._manual_scroll_during_stream = True
+
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._flush_scheduled_render)
@@ -813,16 +1164,27 @@ class MainWindow(QMainWindow):
         self.live_answer_text = ""
         self.live_status_text = ""
 
+        self._debug_log_unsubscribe = None
+        self._debug_log_bridge = DebugLogBridge()
+
         self.setAcceptDrops(True)
         self.setWindowTitle("GPTProject Pro - Streaming Ollama Chat")
         self.resize(self.config.window_width, self.config.window_height)
         self.setStyleSheet(DARK_STYLESHEET)
 
         self._build_ui()
+        self._debug_log_bridge.message.connect(self.append_debug_log)
+        self._attach_debug_logger()
         self.refresh_session_list(select_session=self.current_session_id)
         self.load_session_into_chat(self.current_session_id)
         self.reload_prompt_editor()
         self.update_status_banner("Ready.")
+
+        try:
+            if DEBUG_LOGGER is not None:
+                DEBUG_LOGGER.log_message("[GUI] Debug pane attached. Calls to DEBUG_LOGGER.log_message(str) will appear here.")
+        except Exception:
+            pass
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -921,6 +1283,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_chat_tab(), "Chat")
         tabs.addTab(self._build_settings_tab(), "Settings")
         tabs.addTab(self._build_project_tab(), "Project Tools")
+        tabs.addTab(self._build_debug_tab(), "Debug")
         return tabs
 
     def _build_chat_tab(self) -> QWidget:
@@ -1047,6 +1410,35 @@ class MainWindow(QMainWindow):
             str(_cfg_get(self.config, "tor_socks_url", "socks5h://127.0.0.1:9150"))
         )
 
+        tor_exe_row = QHBoxLayout()
+        self.tor_exe_path_input = QLineEdit(str(_cfg_get(self.config, "tor_exe_path", "")))
+        self.tor_exe_path_input.setPlaceholderText(r"C:\Users\natem\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe")
+        self.browse_tor_exe_button = QPushButton("Browse")
+        self.browse_tor_exe_button.setObjectName("Secondary")
+        self.browse_tor_exe_button.clicked.connect(self.browse_tor_exe)
+        tor_exe_row.addWidget(self.tor_exe_path_input, 1)
+        tor_exe_row.addWidget(self.browse_tor_exe_button)
+
+        tor_data_row = QHBoxLayout()
+        self.tor_data_dir_input = QLineEdit(str(_cfg_get(self.config, "tor_data_dir", "data/tor")))
+        self.tor_data_dir_input.setPlaceholderText("data/tor")
+        self.browse_tor_data_dir_button = QPushButton("Browse")
+        self.browse_tor_data_dir_button.setObjectName("Secondary")
+        self.browse_tor_data_dir_button.clicked.connect(self.browse_tor_data_dir)
+        tor_data_row.addWidget(self.tor_data_dir_input, 1)
+        tor_data_row.addWidget(self.browse_tor_data_dir_button)
+
+        self.tor_auto_start_checkbox = QCheckBox("Start tor.exe automatically for interactive Tor")
+        self.tor_auto_start_checkbox.setChecked(_cfg_bool(self.config, "tor_auto_start", True))
+
+        self.tor_start_timeout_input = QSpinBox()
+        self.tor_start_timeout_input.setRange(3, 3600)
+        self.tor_start_timeout_input.setValue(_cfg_int(self.config, "tor_start_timeout_sec", 45))
+
+        self.interactive_browser_data_dir_input = QLineEdit(
+            str(_cfg_get(self.config, "interactive_browser_data_dir", "data/interactive_browser"))
+        )
+
         self.prefer_tor_for_web_checkbox = QCheckBox("Route normal web/search tools through Tor")
         self.prefer_tor_for_web_checkbox.setChecked(_cfg_bool(self.config, "prefer_tor_for_web", False))
 
@@ -1059,6 +1451,33 @@ class MainWindow(QMainWindow):
         self.stream_chat_checkbox = QCheckBox("Stream chat like Ollama")
         self.stream_chat_checkbox.setChecked(_cfg_bool(self.config, "stream_chat", True))
 
+        self.chat_autoscroll_on_send_checkbox = QCheckBox("Auto-scroll once when sending")
+        self.chat_autoscroll_on_send_checkbox.setChecked(_cfg_bool(self.config, "chat_autoscroll_on_send", True))
+
+        self.chat_autoscroll_during_stream_checkbox = QCheckBox(
+            "Manual scroll while GPT streams — do not auto-follow output"
+        )
+        self.chat_autoscroll_during_stream_checkbox.setChecked(False)
+        self.chat_autoscroll_during_stream_checkbox.setEnabled(False)
+        self.chat_autoscroll_during_stream_checkbox.setToolTip(
+            "Locked off so streaming thinking/answer updates never pull the scrollbar. "
+            "The chat scrolls to the bottom once on send, then only moves when you scroll it."
+        )
+
+        self.max_tool_rounds_input = QSpinBox()
+        self.max_tool_rounds_input.setRange(1, 100)
+        self.max_tool_rounds_input.setValue(_cfg_int(self.config, "max_tool_rounds", 6))
+
+        self.max_tool_result_chars_input = QSpinBox()
+        self.max_tool_result_chars_input.setRange(100, 1000000)
+        self.max_tool_result_chars_input.setSingleStep(500)
+        self.max_tool_result_chars_input.setValue(_cfg_int(self.config, "max_tool_result_chars", 5000))
+
+        self.max_tool_trace_result_chars_input = QSpinBox()
+        self.max_tool_trace_result_chars_input.setRange(50, 250000)
+        self.max_tool_trace_result_chars_input.setSingleStep(100)
+        self.max_tool_trace_result_chars_input.setValue(_cfg_int(self.config, "max_tool_trace_result_chars", 900))
+
         form_layout.addRow("Base URL", self.base_url_input)
         form_layout.addRow("Model", self.model_input)
         form_layout.addRow("API Key", self.api_key_input)
@@ -1069,10 +1488,20 @@ class MainWindow(QMainWindow):
         form_layout.addRow("Prompt Path", self.prompt_path_input)
         form_layout.addRow("Default Session", self.default_session_input)
         form_layout.addRow("Tor SOCKS URL", self.tor_socks_url_input)
+        form_layout.addRow("tor.exe Path", tor_exe_row)
+        form_layout.addRow("Tor Data Dir", tor_data_row)
+        form_layout.addRow("Tor Auto Start", self.tor_auto_start_checkbox)
+        form_layout.addRow("Tor Start Timeout", self.tor_start_timeout_input)
+        form_layout.addRow("Interactive Browser Data", self.interactive_browser_data_dir_input)
         form_layout.addRow("Prefer Tor", self.prefer_tor_for_web_checkbox)
         form_layout.addRow("Visible Thinking", self.show_thinking_checkbox)
         form_layout.addRow("Tool Trace / Status", self.show_tool_trace_checkbox)
         form_layout.addRow("Streaming", self.stream_chat_checkbox)
+        form_layout.addRow("Auto-scroll On Send", self.chat_autoscroll_on_send_checkbox)
+        form_layout.addRow("Auto-scroll While Streaming", self.chat_autoscroll_during_stream_checkbox)
+        form_layout.addRow("Max Tool Rounds", self.max_tool_rounds_input)
+        form_layout.addRow("Max Tool Result Chars", self.max_tool_result_chars_input)
+        form_layout.addRow("Max Tool Trace Chars", self.max_tool_trace_result_chars_input)
 
         outer.addWidget(form_panel)
 
@@ -1227,6 +1656,186 @@ class MainWindow(QMainWindow):
 
         return page
 
+
+    def _build_debug_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+
+        header = QHBoxLayout()
+
+        label = QLabel("Debug Log")
+        label.setObjectName("SectionLabel")
+        header.addWidget(label)
+
+        header.addStretch(1)
+
+        self.debug_autoscroll_checkbox = QCheckBox("Auto-scroll debug log")
+        self.debug_autoscroll_checkbox.setChecked(True)
+        header.addWidget(self.debug_autoscroll_checkbox)
+
+        outer.addLayout(header)
+
+        hint = QLabel(
+            "Any code can call DEBUG_LOGGER.log_message(\"message\") from loggers.py. "
+            "Messages are forwarded here safely through a Qt signal."
+        )
+        hint.setObjectName("MutedLabel")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        self.debug_log_output = QPlainTextEdit()
+        self.debug_log_output.setReadOnly(True)
+        self.debug_log_output.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.debug_log_output.setPlaceholderText("Debug messages will appear here...")
+        self.debug_log_output.setMaximumBlockCount(10000)
+
+        debug_font = QFont("Consolas", 10)
+        debug_font.setStyleHint(QFont.Monospace)
+        self.debug_log_output.setFont(debug_font)
+
+        self.debug_log_output.setStyleSheet("""
+            QPlainTextEdit {
+                background:#020617;
+                color:#d1fae5;
+                border:1px solid #334155;
+                border-radius:12px;
+                padding:10px;
+                selection-background-color:#2563eb;
+            }
+        """)
+        outer.addWidget(self.debug_log_output, 1)
+
+        row = QHBoxLayout()
+
+        self.debug_test_button = QPushButton("Test Log")
+        self.debug_test_button.setObjectName("Secondary")
+        self.debug_test_button.clicked.connect(self.test_debug_log)
+
+        self.debug_clear_button = QPushButton("Clear")
+        self.debug_clear_button.setObjectName("Secondary")
+        self.debug_clear_button.clicked.connect(self.clear_debug_log)
+
+        self.debug_copy_button = QPushButton("Copy")
+        self.debug_copy_button.setObjectName("Secondary")
+        self.debug_copy_button.clicked.connect(self.copy_debug_log)
+
+        self.debug_save_button = QPushButton("Save")
+        self.debug_save_button.setObjectName("Secondary")
+        self.debug_save_button.clicked.connect(self.save_debug_log)
+
+        row.addWidget(self.debug_test_button)
+        row.addWidget(self.debug_clear_button)
+        row.addWidget(self.debug_copy_button)
+        row.addWidget(self.debug_save_button)
+        row.addStretch(1)
+
+        outer.addLayout(row)
+
+        return page
+
+    def _attach_debug_logger(self) -> None:
+        if DEBUG_LOGGER is None:
+            return
+
+        try:
+            subscribe = getattr(DEBUG_LOGGER, "subscribe", None)
+            if callable(subscribe):
+                self._debug_log_unsubscribe = subscribe(self._debug_log_bridge.message.emit, replay=True)
+            else:
+                self._debug_log_unsubscribe = None
+        except Exception as exc:
+            self.append_debug_log(f"[GUI][Debug] Could not attach DEBUG_LOGGER subscriber: {exc}")
+
+    def append_debug_log(self, message: str) -> None:
+        text = str(message or "")
+        if not text:
+            return
+
+        try:
+            if not hasattr(self, "debug_log_output"):
+                return
+
+            self.debug_log_output.appendPlainText(text)
+
+            if getattr(self, "debug_autoscroll_checkbox", None) is None:
+                return
+
+            if self.debug_autoscroll_checkbox.isChecked():
+                bar = self.debug_log_output.verticalScrollBar()
+                bar.setValue(bar.maximum())
+        except Exception:
+            pass
+
+    def clear_debug_log(self) -> None:
+        try:
+            self.debug_log_output.clear()
+        except Exception:
+            pass
+
+        try:
+            if DEBUG_LOGGER is not None and hasattr(DEBUG_LOGGER, "clear"):
+                DEBUG_LOGGER.clear()
+        except Exception:
+            pass
+
+        self.update_status_banner("Debug log cleared.")
+
+    def copy_debug_log(self) -> None:
+        try:
+            QApplication.clipboard().setText(self.debug_log_output.toPlainText())
+            self.update_status_banner("Copied debug log to clipboard.")
+        except Exception as exc:
+            self.update_status_banner(f"Could not copy debug log: {exc}")
+
+    def save_debug_log(self) -> None:
+        try:
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Debug Log",
+                str(Path.cwd() / "debug-log.txt"),
+                "Text Files (*.txt);;Log Files (*.log);;All Files (*)",
+            )
+            if not path:
+                return
+
+            Path(path).write_text(self.debug_log_output.toPlainText(), encoding="utf-8")
+            self.update_status_banner(f"Saved debug log to {path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Save Debug Log Failed", str(exc))
+
+    def test_debug_log(self) -> None:
+        message = "[GUI][Debug] Test log_message call from the Debug pane."
+        try:
+            if DEBUG_LOGGER is not None:
+                DEBUG_LOGGER.log_message(message)
+            else:
+                self.append_debug_log(message + " DEBUG_LOGGER import is not available.")
+        except Exception as exc:
+            self.append_debug_log(f"[GUI][Debug] Test failed: {exc}")
+
+    def browse_tor_exe(self) -> None:
+        start = self.tor_exe_path_input.text().strip() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select tor.exe",
+            start,
+            "Tor executable (tor.exe);;Executables (*.exe);;All Files (*)",
+        )
+
+        if path:
+            self.tor_exe_path_input.setText(path)
+            self.update_status_banner(f"Selected tor.exe: {path}")
+
+    def browse_tor_data_dir(self) -> None:
+        start = self.tor_data_dir_input.text().strip() or str(Path.cwd() / "data" / "tor")
+        path = QFileDialog.getExistingDirectory(self, "Select Tor Data Directory", start)
+
+        if path:
+            self.tor_data_dir_input.setText(path)
+            self.update_status_banner(f"Selected Tor data directory: {path}")
+
     def browse_project_dir(self) -> None:
         start = self.local_project_dir_input.text().strip() or str(Path.cwd())
         path = QFileDialog.getExistingDirectory(self, "Select Local Python Project Directory", start)
@@ -1250,14 +1859,18 @@ class MainWindow(QMainWindow):
         thinking_state = "thinking:on" if _cfg_bool(self.config, "show_thinking", True) else "thinking:off"
         trace_state = "trace:on" if _cfg_bool(self.config, "show_tool_trace", False) else "trace:off"
         stream_state = "stream:on" if _cfg_bool(self.config, "stream_chat", True) else "stream:off"
-        tor_state = "tor:web" if _cfg_bool(self.config, "prefer_tor_for_web", False) else "tor:manual"
+        scroll_state = "scroll:manual-stream"
+        tool_rounds_state = f"tool-rounds:{_cfg_int(self.config, 'max_tool_rounds', 6)}"
+        tor_auto = "auto" if _cfg_bool(self.config, "tor_auto_start", True) else "manual"
+        tor_has_exe = bool(str(_cfg_get(self.config, "tor_exe_path", "") or "").strip())
+        tor_state = ("tor:web" if _cfg_bool(self.config, "prefer_tor_for_web", False) else "tor:manual") + f":{tor_auto}" + (":exe" if tor_has_exe else ":no-exe")
 
         project_dir = str(_cfg_get(self.config, "local_project_dir", "") or "").strip()
         project_state = "project:on" if project_dir and _cfg_bool(self.config, "project_tools_enabled", True) else "project:off"
 
         self.backend_badge.setText(
             f"{self.config.model} | {normalize_native_ollama_base_url(self.config.base_url)} | "
-            f"{stream_state} | {thinking_state} | {trace_state} | {tor_state} | {project_state}"
+            f"{stream_state} | {scroll_state} | {tool_rounds_state} | {thinking_state} | {trace_state} | {tor_state} | {project_state}"
         )
 
         self.statusBar().showMessage(message)
@@ -1277,10 +1890,22 @@ class MainWindow(QMainWindow):
             window_width=self.width(),
             window_height=self.height(),
             tor_socks_url=self.tor_socks_url_input.text().strip() or "socks5h://127.0.0.1:9150",
+            tor_exe_path=self.tor_exe_path_input.text().strip(),
+            tor_auto_start=bool(self.tor_auto_start_checkbox.isChecked()),
+            tor_data_dir=self.tor_data_dir_input.text().strip() or "data/tor",
+            tor_start_timeout_sec=int(self.tor_start_timeout_input.value()),
+            interactive_browser_data_dir=self.interactive_browser_data_dir_input.text().strip() or "data/interactive_browser",
             prefer_tor_for_web=bool(self.prefer_tor_for_web_checkbox.isChecked()),
             show_thinking=bool(self.show_thinking_checkbox.isChecked()),
             show_tool_trace=bool(self.show_tool_trace_checkbox.isChecked()),
             stream_chat=bool(self.stream_chat_checkbox.isChecked()),
+            chat_autoscroll_on_send=bool(self.chat_autoscroll_on_send_checkbox.isChecked()),
+            # Hard-disable stream auto-follow. Streaming re-renders preserve the
+            # exact scrollbar value so the bar only moves when the user moves it.
+            chat_autoscroll_during_stream=False,
+            max_tool_rounds=int(self.max_tool_rounds_input.value()),
+            max_tool_result_chars=int(self.max_tool_result_chars_input.value()),
+            max_tool_trace_result_chars=int(self.max_tool_trace_result_chars_input.value()),
         )
 
         cfg.local_project_dir = self.local_project_dir_input.text().strip()
@@ -1307,10 +1932,21 @@ class MainWindow(QMainWindow):
         self.prompt_path_input.setText(config.prompt_path)
         self.default_session_input.setText(config.default_session)
         self.tor_socks_url_input.setText(str(_cfg_get(config, "tor_socks_url", "socks5h://127.0.0.1:9150")))
+        self.tor_exe_path_input.setText(str(_cfg_get(config, "tor_exe_path", "")))
+        self.tor_auto_start_checkbox.setChecked(_cfg_bool(config, "tor_auto_start", True))
+        self.tor_data_dir_input.setText(str(_cfg_get(config, "tor_data_dir", "data/tor")))
+        self.tor_start_timeout_input.setValue(_cfg_int(config, "tor_start_timeout_sec", 45))
+        self.interactive_browser_data_dir_input.setText(str(_cfg_get(config, "interactive_browser_data_dir", "data/interactive_browser")))
         self.prefer_tor_for_web_checkbox.setChecked(_cfg_bool(config, "prefer_tor_for_web", False))
         self.show_thinking_checkbox.setChecked(_cfg_bool(config, "show_thinking", True))
         self.show_tool_trace_checkbox.setChecked(_cfg_bool(config, "show_tool_trace", False))
         self.stream_chat_checkbox.setChecked(_cfg_bool(config, "stream_chat", True))
+        self.chat_autoscroll_on_send_checkbox.setChecked(_cfg_bool(config, "chat_autoscroll_on_send", True))
+        self.chat_autoscroll_during_stream_checkbox.setChecked(False)
+        self.chat_autoscroll_during_stream_checkbox.setEnabled(False)
+        self.max_tool_rounds_input.setValue(_cfg_int(config, "max_tool_rounds", 6))
+        self.max_tool_result_chars_input.setValue(_cfg_int(config, "max_tool_result_chars", 5000))
+        self.max_tool_trace_result_chars_input.setValue(_cfg_int(config, "max_tool_trace_result_chars", 900))
 
         self.local_project_dir_input.setText(str(_cfg_get(config, "local_project_dir", "")))
         self.project_tools_enabled_checkbox.setChecked(_cfg_bool(config, "project_tools_enabled", True))
@@ -1423,13 +2059,26 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Ollama Detection", f"Could not load installed models.\n\n{message}")
 
     def attach_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Attach files")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Attach files",
+            "",
+            (
+                "Supported files (*.txt *.md *.py *.json *.cs *.cpp *.h *.html *.css *.js *.ts "
+                "*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff "
+                "*.mp4 *.mov *.m4v *.avi *.mkv *.webm *.wmv *.flv *.mpeg *.mpg);;"
+                "Images (*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff);;"
+                "Videos (*.mp4 *.mov *.m4v *.avi *.mkv *.webm *.wmv *.flv *.mpeg *.mpg);;"
+                "Text/code files (*.txt *.md *.py *.json *.cs *.cpp *.h *.html *.css *.js *.ts);;"
+                "All files (*)"
+            ),
+        )
         if not paths:
             return
         self.add_attachments(paths)
 
     def add_attachments(self, paths: list[str]) -> None:
-        total_chars = sum(len(a.content) for a in self.pending_attachments)
+        total_chars = sum(len(a.content) for a in self.pending_attachments if a.kind == "text")
 
         for path in paths:
             try:
@@ -1438,14 +2087,16 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Attachment Error", f"Could not read:\n{path}\n\n{exc}")
                 continue
 
-            if total_chars + len(attachment.content) > MAX_TOTAL_ATTACHMENT_CHARS:
+            if attachment.kind == "text" and total_chars + len(attachment.content) > MAX_TOTAL_ATTACHMENT_CHARS:
                 attachment.warning = (
                     (attachment.warning + " " if attachment.warning else "")
-                    + f"Skipped because total attachment budget is {MAX_TOTAL_ATTACHMENT_CHARS} characters."
+                    + f"Skipped because total text attachment budget is {MAX_TOTAL_ATTACHMENT_CHARS} characters."
                 )
                 attachment.content = "[Skipped due to total attachment budget.]"
 
-            total_chars += len(attachment.content)
+            if attachment.kind == "text":
+                total_chars += len(attachment.content)
+
             self.pending_attachments.append(attachment)
 
         self.refresh_attachment_list()
@@ -1471,7 +2122,11 @@ class MainWindow(QMainWindow):
     def refresh_attachment_list(self) -> None:
         self.attachment_list.clear()
         for attachment in self.pending_attachments:
-            text = attachment.name
+            label = attachment.kind.upper()
+            size = f"{attachment.size_bytes} bytes" if attachment.size_bytes else ""
+            text = f"[{label}] {attachment.name}"
+            if size:
+                text += f"  ·  {size}"
             if attachment.warning:
                 text += f"  ·  {attachment.warning}"
             self.attachment_list.addItem(text)
@@ -1539,6 +2194,10 @@ class MainWindow(QMainWindow):
         bar = self.chat_view.verticalScrollBar()
         return bar.value(), bar.maximum()
 
+    def _is_chat_near_bottom(self, threshold: int = 24) -> bool:
+        bar = self.chat_view.verticalScrollBar()
+        return (bar.maximum() - bar.value()) <= max(0, int(threshold))
+
     def _restore_scroll_state(
         self,
         old_value: int,
@@ -1565,6 +2224,13 @@ class MainWindow(QMainWindow):
         self._last_rendered_html = ""
 
     def _schedule_render_chat(self, *, force_bottom: bool = False, preserve_scroll: bool = True) -> None:
+        # During streaming, scheduled live updates must never yank the scrollbar
+        # to the bottom. The send/session-load path can still call render_chat()
+        # directly with force_bottom=True for the one initial jump.
+        if self._request_running and self._manual_scroll_during_stream:
+            force_bottom = False
+            preserve_scroll = True
+
         self._pending_render_force_bottom = self._pending_render_force_bottom or force_bottom
         self._pending_render_preserve_scroll = preserve_scroll
 
@@ -1712,7 +2378,11 @@ class MainWindow(QMainWindow):
         self._show_loading_placeholder = True
         self._invalidate_render_cache()
 
-        self.render_chat(force=True, force_bottom=True, preserve_scroll=False)
+        # Initial send behavior: optionally jump to the bottom one time so the
+        # new user message/live assistant bubble is visible. After this render,
+        # streaming snapshots/status updates preserve the exact scrollbar value.
+        force_bottom = _cfg_bool(self.config, "chat_autoscroll_on_send", True)
+        self.render_chat(force=True, force_bottom=force_bottom, preserve_scroll=not force_bottom)
 
     def _stop_loading(self) -> None:
         if self._render_timer.isActive():
@@ -1749,6 +2419,8 @@ class MainWindow(QMainWindow):
         self.project_save_button.setEnabled(enabled)
         self.project_insert_prompt_button.setEnabled(enabled)
         self.browse_project_dir_button.setEnabled(enabled)
+        self.browse_tor_exe_button.setEnabled(enabled)
+        self.browse_tor_data_dir_button.setEnabled(enabled)
 
     def _thread_connect(self, signal: Callable, slot: Callable) -> None:
         signal.connect(slot)
@@ -1779,6 +2451,11 @@ class MainWindow(QMainWindow):
         self.refresh_attachment_list()
 
         self.update_status_banner("Streaming request from local Ollama model...")
+        try:
+            if DEBUG_LOGGER is not None:
+                DEBUG_LOGGER.log_message(f"[GUI][Chat] Sending message in session {self.current_session_id!r}.")
+        except Exception:
+            pass
         self._start_loading()
 
         self._thread = QThread(self)
@@ -1810,6 +2487,8 @@ class MainWindow(QMainWindow):
         self.live_thinking_text = new_thinking
         self.live_answer_text = new_answer
 
+        # Do not auto-follow streaming output. Preserve the exact scrollbar
+        # position so the scrollbar only moves when the user engages with it.
         self._schedule_render_chat(force_bottom=False, preserve_scroll=True)
 
     def on_stream_status(self, text: str) -> None:
@@ -1821,7 +2500,14 @@ class MainWindow(QMainWindow):
 
         self.live_status_text = text
         self.update_status_banner(text)
+        try:
+            if DEBUG_LOGGER is not None:
+                DEBUG_LOGGER.log_message(f"[GUI][Status] {text}")
+        except Exception:
+            pass
 
+        # Status updates also re-render the live assistant bubble, so keep them
+        # scroll-stable for the same reason.
         self._schedule_render_chat(force_bottom=False, preserve_scroll=True)
 
     def on_response(self, _text: str) -> None:
@@ -1840,6 +2526,11 @@ class MainWindow(QMainWindow):
 
         self.refresh_session_list(select_session=self.current_session_id)
         self._stop_loading()
+        try:
+            if DEBUG_LOGGER is not None:
+                DEBUG_LOGGER.log_message(f"[GUI][Chat] Response received for session {self.current_session_id!r}.")
+        except Exception:
+            pass
         self.update_status_banner("Response received.")
 
     def on_error(self, message: str) -> None:
@@ -1855,7 +2546,13 @@ class MainWindow(QMainWindow):
 
         self.memory = MemoryStore(self.config.db_path)
         self._stop_loading()
+        try:
+            if DEBUG_LOGGER is not None:
+                DEBUG_LOGGER.log_message(f"[GUI][Error] {message}")
+        except Exception:
+            pass
 
+        old_value, old_maximum = self._get_scroll_state()
         current_html = self.chat_view.toHtml()
         error_html = _message_to_html("Error", message, mine=False, subtle=True)
 
@@ -1866,6 +2563,8 @@ class MainWindow(QMainWindow):
         else:
             self.chat_view.setHtml(error_html)
             self._last_rendered_html = error_html
+
+        self._restore_scroll_state(old_value, old_maximum, force_bottom=False, preserve_exact_position=True)
 
         self.update_status_banner("Request failed.")
         QMessageBox.warning(self, "GPTProject Error", message)
@@ -1972,6 +2671,13 @@ class MainWindow(QMainWindow):
 
         if self._render_timer.isActive():
             self._render_timer.stop()
+
+        try:
+            if self._debug_log_unsubscribe is not None:
+                self._debug_log_unsubscribe()
+                self._debug_log_unsubscribe = None
+        except Exception:
+            pass
 
         self.config = self.build_config_from_form()
         self.config.window_width = self.width()
