@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QStatusBar,
@@ -58,7 +59,6 @@ try:
     from provider_local import discover_ollama_models as _discover_ollama_models
 except Exception:
     _discover_ollama_models = None
-
 
 try:
     from loggers import DEBUG_LOGGER
@@ -155,6 +155,46 @@ QTabBar::tab {
 QTabBar::tab:selected {
     background: #1d4ed8;
     color: white;
+}
+QScrollArea {
+    background: #111827;
+    border: none;
+}
+QScrollBar:vertical {
+    background: #0f172a;
+    width: 14px;
+    margin: 0;
+    border-radius: 7px;
+}
+QScrollBar::handle:vertical {
+    background: #334155;
+    min-height: 34px;
+    border-radius: 7px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #475569;
+}
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar:horizontal {
+    background: #0f172a;
+    height: 14px;
+    margin: 0;
+    border-radius: 7px;
+}
+QScrollBar::handle:horizontal {
+    background: #334155;
+    min-width: 34px;
+    border-radius: 7px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #475569;
+}
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0;
 }
 """
 
@@ -316,16 +356,6 @@ def _apply_compact_repair_table(text: str) -> str:
 
 
 def repair_compacted_thinking_text(text: str) -> str:
-    """
-    Display-only repair for compacted model thinking text.
-
-    Some local/Ollama-style streams can arrive without normal word spacing, e.g.:
-        The user wantsmeto:1.Openaninteractive Torbrowsersession
-
-    This keeps the original answer content intact, but makes the visible
-    Thinking panel readable by restoring obvious spaces, numbered steps,
-    sentence breaks, and tool-parameter lines.
-    """
     raw = text or ""
     if not raw.strip():
         return ""
@@ -647,7 +677,10 @@ def read_attachment_file(path_str: str) -> AttachmentPayload:
     suffix = path.suffix.lower()
     kind = _guess_attachment_kind(path)
     mime_type = mimetypes.guess_type(str(path))[0] or (
-        "image/*" if kind == "image" else "video/*" if kind == "video" else "text/plain" if kind == "text" else "application/octet-stream"
+        "image/*" if kind == "image"
+        else "video/*" if kind == "video"
+        else "text/plain" if kind == "text"
+        else "application/octet-stream"
     )
 
     try:
@@ -702,10 +735,6 @@ def read_attachment_file(path_str: str) -> AttachmentPayload:
     )
 
 
-def _text_to_html(text: str) -> str:
-    return html.escape(text or "")
-
-
 def _looks_like_numbered_line(line: str) -> bool:
     return bool(re.match(r"^\s*\d+[.)]\s+", line or ""))
 
@@ -715,11 +744,6 @@ def _looks_like_bullet_line(line: str) -> bool:
 
 
 def _render_readable_plain_html(text: str, text_color: str = "#f8fafc") -> str:
-    """
-    Render plain text as readable paragraphs/list rows instead of one dense div.
-    QTextBrowser supports enough HTML/CSS for div-based paragraph spacing to work
-    more reliably than relying on repeated <br> tags.
-    """
     parts: list[str] = []
     pending_paragraph: list[str] = []
 
@@ -796,7 +820,6 @@ def _render_text_and_code_chunks(
             normalized = repair_compacted_thinking_text(chunk) if thinking else normalize_plain_text(chunk)
             if not normalized.strip():
                 continue
-
             parts.append(_render_readable_plain_html(normalized, text_color=text_color))
         else:
             lang = html.escape(language or "code")
@@ -1048,12 +1071,6 @@ def _message_to_html(speaker: str, raw_text: str, mine: bool, subtle: bool = Fal
 
 
 class DebugLogBridge(QObject):
-    """
-    Tiny Qt bridge for loggers.DEBUG_LOGGER.
-
-    DebugLogger can be called from worker/background threads. Emitting this
-    signal moves the append into the GUI thread before touching widgets.
-    """
     message = pyqtSignal(str)
 
 
@@ -1146,11 +1163,6 @@ class MainWindow(QMainWindow):
         self._pending_render_force_bottom = False
         self._pending_render_preserve_scroll = True
 
-        # Streaming scroll policy:
-        # - On send/session load the chat can jump to the bottom once.
-        # - While GPT is thinking/writing, every re-render preserves the user's
-        #   current scrollbar value exactly.
-        # - The scrollbar only moves after that when the user moves it.
         self._manual_scroll_during_stream = True
 
         self._render_timer = QTimer(self)
@@ -1182,7 +1194,9 @@ class MainWindow(QMainWindow):
 
         try:
             if DEBUG_LOGGER is not None:
-                DEBUG_LOGGER.log_message("[GUI] Debug pane attached. Calls to DEBUG_LOGGER.log_message(str) will appear here.")
+                DEBUG_LOGGER.log_message(
+                    "[GUI] Debug pane attached. Calls to DEBUG_LOGGER.log_message(str) will appear here."
+                )
         except Exception:
             pass
 
@@ -1271,7 +1285,7 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.clear_session_button)
         layout.addLayout(row2)
 
-        help_text = QLabel("Drop text/code files into the window or use Attach Files.")
+        help_text = QLabel("Drop text/code/image/video files into the window or use Attach Files.")
         help_text.setObjectName("MutedLabel")
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
@@ -1370,14 +1384,36 @@ class MainWindow(QMainWindow):
 
     def _build_settings_tab(self) -> QWidget:
         page = QWidget()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(12)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        page_layout.addWidget(scroll, 1)
+
+        content = QWidget()
+        content.setMinimumWidth(940)
+
+        outer = QVBoxLayout(content)
+        outer.setContentsMargins(10, 10, 18, 10)
+        outer.setSpacing(14)
 
         form_panel = QFrame()
+        form_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+
         form_layout = QFormLayout(form_panel)
-        form_layout.setContentsMargins(10, 10, 10, 10)
-        form_layout.setSpacing(10)
+        form_layout.setContentsMargins(12, 12, 12, 12)
+        form_layout.setHorizontalSpacing(18)
+        form_layout.setVerticalSpacing(12)
+        form_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form_layout.setFormAlignment(Qt.AlignTop)
+        form_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form_layout.setRowWrapPolicy(QFormLayout.DontWrapRows)
 
         self.base_url_input = QLineEdit(self.config.base_url)
 
@@ -1411,20 +1447,32 @@ class MainWindow(QMainWindow):
         )
 
         tor_exe_row = QHBoxLayout()
+        tor_exe_row.setContentsMargins(0, 0, 0, 0)
+        tor_exe_row.setSpacing(8)
+
         self.tor_exe_path_input = QLineEdit(str(_cfg_get(self.config, "tor_exe_path", "")))
-        self.tor_exe_path_input.setPlaceholderText(r"C:\Users\natem\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe")
+        self.tor_exe_path_input.setPlaceholderText(
+            r"C:\Users\natem\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe"
+        )
+
         self.browse_tor_exe_button = QPushButton("Browse")
         self.browse_tor_exe_button.setObjectName("Secondary")
         self.browse_tor_exe_button.clicked.connect(self.browse_tor_exe)
+
         tor_exe_row.addWidget(self.tor_exe_path_input, 1)
         tor_exe_row.addWidget(self.browse_tor_exe_button)
 
         tor_data_row = QHBoxLayout()
+        tor_data_row.setContentsMargins(0, 0, 0, 0)
+        tor_data_row.setSpacing(8)
+
         self.tor_data_dir_input = QLineEdit(str(_cfg_get(self.config, "tor_data_dir", "data/tor")))
         self.tor_data_dir_input.setPlaceholderText("data/tor")
+
         self.browse_tor_data_dir_button = QPushButton("Browse")
         self.browse_tor_data_dir_button.setObjectName("Secondary")
         self.browse_tor_data_dir_button.clicked.connect(self.browse_tor_data_dir)
+
         tor_data_row.addWidget(self.tor_data_dir_input, 1)
         tor_data_row.addWidget(self.browse_tor_data_dir_button)
 
@@ -1452,7 +1500,9 @@ class MainWindow(QMainWindow):
         self.stream_chat_checkbox.setChecked(_cfg_bool(self.config, "stream_chat", True))
 
         self.chat_autoscroll_on_send_checkbox = QCheckBox("Auto-scroll once when sending")
-        self.chat_autoscroll_on_send_checkbox.setChecked(_cfg_bool(self.config, "chat_autoscroll_on_send", True))
+        self.chat_autoscroll_on_send_checkbox.setChecked(
+            _cfg_bool(self.config, "chat_autoscroll_on_send", True)
+        )
 
         self.chat_autoscroll_during_stream_checkbox = QCheckBox(
             "Manual scroll while GPT streams — do not auto-follow output"
@@ -1476,7 +1526,40 @@ class MainWindow(QMainWindow):
         self.max_tool_trace_result_chars_input = QSpinBox()
         self.max_tool_trace_result_chars_input.setRange(50, 250000)
         self.max_tool_trace_result_chars_input.setSingleStep(100)
-        self.max_tool_trace_result_chars_input.setValue(_cfg_int(self.config, "max_tool_trace_result_chars", 900))
+        self.max_tool_trace_result_chars_input.setValue(
+            _cfg_int(self.config, "max_tool_trace_result_chars", 900)
+        )
+
+        wide_text_widgets = [
+            self.base_url_input,
+            self.model_input,
+            self.api_key_input,
+            self.db_path_input,
+            self.prompt_path_input,
+            self.default_session_input,
+            self.tor_socks_url_input,
+            self.tor_exe_path_input,
+            self.tor_data_dir_input,
+            self.interactive_browser_data_dir_input,
+        ]
+
+        for widget in wide_text_widgets:
+            widget.setMinimumWidth(540)
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        spin_widgets = [
+            self.temperature_input,
+            self.max_history_input,
+            self.timeout_input,
+            self.tor_start_timeout_input,
+            self.max_tool_rounds_input,
+            self.max_tool_result_chars_input,
+            self.max_tool_trace_result_chars_input,
+        ]
+
+        for widget in spin_widgets:
+            widget.setMinimumWidth(160)
+            widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         form_layout.addRow("Base URL", self.base_url_input)
         form_layout.addRow("Model", self.model_input)
@@ -1506,6 +1589,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(form_panel)
 
         button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
 
         self.load_models_button = QPushButton("Load Installed Models")
         self.load_models_button.setObjectName("Secondary")
@@ -1522,6 +1607,7 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.load_models_button)
         button_row.addWidget(self.reload_config_button)
         button_row.addWidget(self.save_prompt_button)
+        button_row.addStretch(1)
 
         outer.addLayout(button_row)
 
@@ -1538,7 +1624,13 @@ class MainWindow(QMainWindow):
 
         self.prompt_editor = QPlainTextEdit()
         self.prompt_editor.setPlaceholderText("Edit the system prompt used for every chat call.")
+        self.prompt_editor.setMinimumHeight(360)
+        self.prompt_editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         outer.addWidget(self.prompt_editor, 1)
+
+        outer.addStretch(1)
+
+        scroll.setWidget(content)
 
         return page
 
@@ -1655,7 +1747,6 @@ class MainWindow(QMainWindow):
         outer.addWidget(help_box, 1)
 
         return page
-
 
     def _build_debug_tab(self) -> QWidget:
         page = QWidget()
@@ -1863,14 +1954,17 @@ class MainWindow(QMainWindow):
         tool_rounds_state = f"tool-rounds:{_cfg_int(self.config, 'max_tool_rounds', 6)}"
         tor_auto = "auto" if _cfg_bool(self.config, "tor_auto_start", True) else "manual"
         tor_has_exe = bool(str(_cfg_get(self.config, "tor_exe_path", "") or "").strip())
-        tor_state = ("tor:web" if _cfg_bool(self.config, "prefer_tor_for_web", False) else "tor:manual") + f":{tor_auto}" + (":exe" if tor_has_exe else ":no-exe")
+        tor_state = (
+            "tor:web" if _cfg_bool(self.config, "prefer_tor_for_web", False) else "tor:manual"
+        ) + f":{tor_auto}" + (":exe" if tor_has_exe else ":no-exe")
 
         project_dir = str(_cfg_get(self.config, "local_project_dir", "") or "").strip()
         project_state = "project:on" if project_dir and _cfg_bool(self.config, "project_tools_enabled", True) else "project:off"
 
         self.backend_badge.setText(
             f"{self.config.model} | {normalize_native_ollama_base_url(self.config.base_url)} | "
-            f"{stream_state} | {scroll_state} | {tool_rounds_state} | {thinking_state} | {trace_state} | {tor_state} | {project_state}"
+            f"{stream_state} | {scroll_state} | {tool_rounds_state} | {thinking_state} | "
+            f"{trace_state} | {tor_state} | {project_state}"
         )
 
         self.statusBar().showMessage(message)
@@ -1900,8 +1994,6 @@ class MainWindow(QMainWindow):
             show_tool_trace=bool(self.show_tool_trace_checkbox.isChecked()),
             stream_chat=bool(self.stream_chat_checkbox.isChecked()),
             chat_autoscroll_on_send=bool(self.chat_autoscroll_on_send_checkbox.isChecked()),
-            # Hard-disable stream auto-follow. Streaming re-renders preserve the
-            # exact scrollbar value so the bar only moves when the user moves it.
             chat_autoscroll_during_stream=False,
             max_tool_rounds=int(self.max_tool_rounds_input.value()),
             max_tool_result_chars=int(self.max_tool_result_chars_input.value()),
@@ -1936,7 +2028,9 @@ class MainWindow(QMainWindow):
         self.tor_auto_start_checkbox.setChecked(_cfg_bool(config, "tor_auto_start", True))
         self.tor_data_dir_input.setText(str(_cfg_get(config, "tor_data_dir", "data/tor")))
         self.tor_start_timeout_input.setValue(_cfg_int(config, "tor_start_timeout_sec", 45))
-        self.interactive_browser_data_dir_input.setText(str(_cfg_get(config, "interactive_browser_data_dir", "data/interactive_browser")))
+        self.interactive_browser_data_dir_input.setText(
+            str(_cfg_get(config, "interactive_browser_data_dir", "data/interactive_browser"))
+        )
         self.prefer_tor_for_web_checkbox.setChecked(_cfg_bool(config, "prefer_tor_for_web", False))
         self.show_thinking_checkbox.setChecked(_cfg_bool(config, "show_thinking", True))
         self.show_tool_trace_checkbox.setChecked(_cfg_bool(config, "show_tool_trace", False))
@@ -2224,9 +2318,6 @@ class MainWindow(QMainWindow):
         self._last_rendered_html = ""
 
     def _schedule_render_chat(self, *, force_bottom: bool = False, preserve_scroll: bool = True) -> None:
-        # During streaming, scheduled live updates must never yank the scrollbar
-        # to the bottom. The send/session-load path can still call render_chat()
-        # directly with force_bottom=True for the one initial jump.
         if self._request_running and self._manual_scroll_during_stream:
             force_bottom = False
             preserve_scroll = True
@@ -2378,9 +2469,6 @@ class MainWindow(QMainWindow):
         self._show_loading_placeholder = True
         self._invalidate_render_cache()
 
-        # Initial send behavior: optionally jump to the bottom one time so the
-        # new user message/live assistant bubble is visible. After this render,
-        # streaming snapshots/status updates preserve the exact scrollbar value.
         force_bottom = _cfg_bool(self.config, "chat_autoscroll_on_send", True)
         self.render_chat(force=True, force_bottom=force_bottom, preserve_scroll=not force_bottom)
 
@@ -2451,11 +2539,13 @@ class MainWindow(QMainWindow):
         self.refresh_attachment_list()
 
         self.update_status_banner("Streaming request from local Ollama model...")
+
         try:
             if DEBUG_LOGGER is not None:
                 DEBUG_LOGGER.log_message(f"[GUI][Chat] Sending message in session {self.current_session_id!r}.")
         except Exception:
             pass
+
         self._start_loading()
 
         self._thread = QThread(self)
@@ -2487,8 +2577,6 @@ class MainWindow(QMainWindow):
         self.live_thinking_text = new_thinking
         self.live_answer_text = new_answer
 
-        # Do not auto-follow streaming output. Preserve the exact scrollbar
-        # position so the scrollbar only moves when the user engages with it.
         self._schedule_render_chat(force_bottom=False, preserve_scroll=True)
 
     def on_stream_status(self, text: str) -> None:
@@ -2500,14 +2588,13 @@ class MainWindow(QMainWindow):
 
         self.live_status_text = text
         self.update_status_banner(text)
+
         try:
             if DEBUG_LOGGER is not None:
                 DEBUG_LOGGER.log_message(f"[GUI][Status] {text}")
         except Exception:
             pass
 
-        # Status updates also re-render the live assistant bubble, so keep them
-        # scroll-stable for the same reason.
         self._schedule_render_chat(force_bottom=False, preserve_scroll=True)
 
     def on_response(self, _text: str) -> None:
@@ -2526,11 +2613,13 @@ class MainWindow(QMainWindow):
 
         self.refresh_session_list(select_session=self.current_session_id)
         self._stop_loading()
+
         try:
             if DEBUG_LOGGER is not None:
                 DEBUG_LOGGER.log_message(f"[GUI][Chat] Response received for session {self.current_session_id!r}.")
         except Exception:
             pass
+
         self.update_status_banner("Response received.")
 
     def on_error(self, message: str) -> None:
@@ -2546,6 +2635,7 @@ class MainWindow(QMainWindow):
 
         self.memory = MemoryStore(self.config.db_path)
         self._stop_loading()
+
         try:
             if DEBUG_LOGGER is not None:
                 DEBUG_LOGGER.log_message(f"[GUI][Error] {message}")

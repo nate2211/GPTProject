@@ -14,6 +14,11 @@ from urllib.parse import quote_plus, unquote, urljoin, urlparse
 import requests
 
 try:
+    from loggers import DEBUG_LOGGER
+except Exception:
+    DEBUG_LOGGER = None
+
+try:
     from retrieval import SimpleFileRetrieval
 except Exception:
     SimpleFileRetrieval = None
@@ -861,6 +866,193 @@ GOOD_BONUS_DOMAINS = {
 }
 
 
+
+# ======================= Tool Call Debug Logging ============================
+# Logs exactly what GPT sent into every tool before wrappers normalize params.
+# JSONL path:
+#   data/logs/tool-calls.jsonl
+#
+# The logger redacts common secret-bearing keys, writes to disk, and mirrors
+# messages to DEBUG_LOGGER when your GUI debug bridge is attached.
+
+TOOL_CALL_LOG_ENABLED = True
+TOOL_CALL_LOG_PATH = Path("data/logs/tool-calls.jsonl")
+
+_TOOL_SECRET_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "auth",
+    "token",
+    "access_token",
+    "refresh_token",
+    "cookie",
+    "cookies",
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "private_key",
+    "bearer",
+    "session",
+}
+
+
+def _tool_json_safe(value: Any, max_string: int = 2000) -> Any:
+    try:
+        if isinstance(value, dict):
+            return {
+                str(k): _tool_json_safe(v, max_string=max_string)
+                for k, v in value.items()
+            }
+
+        if isinstance(value, list):
+            return [_tool_json_safe(v, max_string=max_string) for v in value[:200]]
+
+        if isinstance(value, tuple):
+            return [_tool_json_safe(v, max_string=max_string) for v in value[:200]]
+
+        if isinstance(value, set):
+            return [_tool_json_safe(v, max_string=max_string) for v in list(value)[:200]]
+
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            if isinstance(value, str) and len(value) > max_string:
+                return value[:max_string] + f"... [truncated {len(value) - max_string} chars]"
+            return value
+
+        return repr(value)
+    except Exception:
+        return "<unserializable>"
+
+
+def _tool_redact(value: Any) -> Any:
+    try:
+        if isinstance(value, dict):
+            out: Dict[str, Any] = {}
+            for key, item in value.items():
+                key_text = str(key)
+                key_lower = key_text.lower()
+
+                if key_lower in _TOOL_SECRET_KEYS or any(secret in key_lower for secret in _TOOL_SECRET_KEYS):
+                    out[key_text] = "[REDACTED]"
+                else:
+                    out[key_text] = _tool_redact(item)
+
+            return out
+
+        if isinstance(value, list):
+            return [_tool_redact(item) for item in value]
+
+        if isinstance(value, tuple):
+            return [_tool_redact(item) for item in value]
+
+        return _tool_json_safe(value)
+    except Exception:
+        return "<redaction_failed>"
+
+
+def _tool_log_event(event: str, data: Dict[str, Any]) -> None:
+    if not TOOL_CALL_LOG_ENABLED:
+        return
+
+    try:
+        payload = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "unix_time": int(time.time()),
+            "event": event,
+            **_tool_redact(data),
+        }
+
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+        try:
+            TOOL_CALL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with TOOL_CALL_LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
+
+        try:
+            if DEBUG_LOGGER is not None:
+                DEBUG_LOGGER.log_message(f"[TOOLS][{event}] {line}")
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+
+def _tool_result_summary(result: Any) -> Dict[str, Any]:
+    try:
+        if isinstance(result, dict):
+            return {
+                "type": "dict",
+                "ok": result.get("ok"),
+                "keys": list(result.keys())[:80],
+                "error": result.get("error", ""),
+            }
+
+        if isinstance(result, list):
+            return {
+                "type": "list",
+                "count": len(result),
+                "preview": _tool_json_safe(result[:3], max_string=500),
+            }
+
+        return {
+            "type": type(result).__name__,
+            "preview": _tool_json_safe(result, max_string=1000),
+        }
+    except Exception as exc:
+        return {
+            "type": "unknown",
+            "error": f"Could not summarize result: {exc}",
+        }
+
+
+def read_tool_call_log(limit: int = 50) -> Dict[str, Any]:
+    """
+    Read recent GPT tool-call logs.
+
+    This shows the raw tool name/arguments GPT sent, the parsed kwargs, and
+    tracker-normalized calls when tracker tools are used.
+    """
+    try:
+        limit = max(1, min(int(limit or 50), 500))
+
+        if not TOOL_CALL_LOG_PATH.exists():
+            return {
+                "ok": True,
+                "path": str(TOOL_CALL_LOG_PATH),
+                "count": 0,
+                "events": [],
+            }
+
+        lines = TOOL_CALL_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = lines[-limit:]
+
+        events = []
+        for line in tail:
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                events.append({"raw": line})
+
+        return {
+            "ok": True,
+            "path": str(TOOL_CALL_LOG_PATH),
+            "count": len(events),
+            "events": events,
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "path": str(TOOL_CALL_LOG_PATH),
+        }
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -893,57 +1085,167 @@ class ToolRegistry:
         return [tool.as_ollama_tool() for tool in self._tools.values()]
 
     def call(self, name: str, arguments: Any) -> str:
+        call_id = f"{int(time.time() * 1000)}-{abs(hash(name)) % 100000}"
+
+        _tool_log_event(
+            "RAW_TOOL_CALL_RECEIVED",
+            {
+                "call_id": call_id,
+                "tool": name,
+                "raw_arguments_type": type(arguments).__name__,
+                "raw_arguments": arguments,
+            },
+        )
+
         if name not in self._tools:
-            return json.dumps(
+            error_result = {
+                "ok": False,
+                "error": f"Unknown tool: {name}",
+                "available_tools": self.names(),
+            }
+
+            _tool_log_event(
+                "TOOL_CALL_UNKNOWN_TOOL",
                 {
-                    "ok": False,
-                    "error": f"Unknown tool: {name}",
-                    "available_tools": self.names(),
+                    "call_id": call_id,
+                    "tool": name,
+                    "result": error_result,
                 },
-                ensure_ascii=False,
             )
+
+            return json.dumps(error_result, ensure_ascii=False)
 
         if isinstance(arguments, str):
             try:
                 args = json.loads(arguments or "{}")
             except json.JSONDecodeError as exc:
-                return json.dumps(
-                    {"ok": False, "error": f"Invalid JSON tool arguments: {exc}"},
-                    ensure_ascii=False,
+                error_result = {
+                    "ok": False,
+                    "error": f"Invalid JSON tool arguments: {exc}",
+                }
+
+                _tool_log_event(
+                    "TOOL_CALL_BAD_JSON",
+                    {
+                        "call_id": call_id,
+                        "tool": name,
+                        "raw_arguments": arguments,
+                        "error": str(exc),
+                    },
                 )
+
+                return json.dumps(error_result, ensure_ascii=False)
+
         elif isinstance(arguments, dict):
             args = arguments
+
         else:
-            return json.dumps(
+            error_result = {
+                "ok": False,
+                "error": "Tool arguments must be a JSON object or JSON string.",
+            }
+
+            _tool_log_event(
+                "TOOL_CALL_BAD_ARGUMENT_TYPE",
                 {
-                    "ok": False,
-                    "error": "Tool arguments must be a JSON object or JSON string.",
+                    "call_id": call_id,
+                    "tool": name,
+                    "raw_arguments_type": type(arguments).__name__,
+                    "raw_arguments": arguments,
+                    "error": error_result["error"],
                 },
-                ensure_ascii=False,
             )
 
+            return json.dumps(error_result, ensure_ascii=False)
+
         if not isinstance(args, dict):
-            return json.dumps(
+            error_result = {
+                "ok": False,
+                "error": "Tool arguments must decode to a JSON object.",
+            }
+
+            _tool_log_event(
+                "TOOL_CALL_ARGS_NOT_OBJECT",
                 {
-                    "ok": False,
-                    "error": "Tool arguments must decode to a JSON object.",
+                    "call_id": call_id,
+                    "tool": name,
+                    "decoded_arguments_type": type(args).__name__,
+                    "decoded_arguments": args,
+                    "error": error_result["error"],
                 },
-                ensure_ascii=False,
             )
+
+            return json.dumps(error_result, ensure_ascii=False)
+
+        _tool_log_event(
+            "TOOL_CALL_ARGS_PARSED",
+            {
+                "call_id": call_id,
+                "tool": name,
+                "args": args,
+            },
+        )
+
+        started = time.time()
 
         try:
             result = self._tools[name].fn(**args)
+            elapsed_ms = int((time.time() - started) * 1000)
+
+            _tool_log_event(
+                "TOOL_CALL_RESULT",
+                {
+                    "call_id": call_id,
+                    "tool": name,
+                    "elapsed_ms": elapsed_ms,
+                    "result_summary": _tool_result_summary(result),
+                },
+            )
+
             return json.dumps(result, ensure_ascii=False)
+
         except TypeError as exc:
-            return json.dumps(
-                {"ok": False, "error": f"Invalid tool arguments for {name}: {exc}"},
-                ensure_ascii=False,
+            elapsed_ms = int((time.time() - started) * 1000)
+
+            error_result = {
+                "ok": False,
+                "error": f"Invalid tool arguments for {name}: {exc}",
+            }
+
+            _tool_log_event(
+                "TOOL_CALL_TYPE_ERROR",
+                {
+                    "call_id": call_id,
+                    "tool": name,
+                    "elapsed_ms": elapsed_ms,
+                    "args": args,
+                    "error": str(exc),
+                },
             )
+
+            return json.dumps(error_result, ensure_ascii=False)
+
         except Exception as exc:
-            return json.dumps(
-                {"ok": False, "error": f"Tool {name} failed: {exc}"},
-                ensure_ascii=False,
+            elapsed_ms = int((time.time() - started) * 1000)
+
+            error_result = {
+                "ok": False,
+                "error": f"Tool {name} failed: {exc}",
+            }
+
+            _tool_log_event(
+                "TOOL_CALL_EXCEPTION",
+                {
+                    "call_id": call_id,
+                    "tool": name,
+                    "elapsed_ms": elapsed_ms,
+                    "args": args,
+                    "error": str(exc),
+                },
             )
+
+            return json.dumps(error_result, ensure_ascii=False)
+
 
 
 def get_time() -> Dict[str, str]:
@@ -4897,6 +5199,17 @@ def _call_tracker_engine_tool(
         merged_params.setdefault("export_format", "json")
     elif raw_key in {"export_markdown", "markdown", "md"}:
         merged_params.setdefault("export_format", "markdown")
+
+    _tool_log_event(
+        "TRACKER_ENGINE_NORMALIZED_CALL",
+        {
+            "requested_action": action,
+            "fixed_action": fixed_action,
+            "payload": fixed_payload,
+            "params": merged_params,
+            "tracker_engine_available": _tracker_engine_available(),
+        },
+    )
 
     try:
         data = fn(action=fixed_action, payload=fixed_payload, params=merged_params)
@@ -9024,6 +9337,26 @@ def build_default_tool_registry(
                 "additionalProperties": False,
             },
             fn=lambda: get_time(),
+        )
+    )
+
+
+    tools.register(
+        ToolSpec(
+            name="read_tool_call_log",
+            description="Read recent GPT tool-call debug logs showing raw tool names, parsed params, and tracker-normalized params.",
+            parameters=_schema(
+                {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "description": "Number of recent log events to return.",
+                    },
+                },
+                required=[],
+            ),
+            fn=read_tool_call_log,
         )
     )
 
