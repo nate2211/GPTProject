@@ -779,6 +779,118 @@ except Exception:
         engine_INTERACTIVE_BROWSER_ACTIONS = None
 
 
+# ======================= Web Discovery Engine Import ========================
+# Put web_discovery_engines.py beside tools.py. These engines are passive web
+# discovery helpers: TLS certificate summary, historical DNS hints, JS bundle
+# chunk mining, WebSocket discovery, GraphQL endpoint detection, REST route
+# probing with HEAD/OPTIONS, sitemap parsing, robots.txt harvesting, social
+# metadata extraction, and CDN asset hints.
+try:
+    import web_discovery_engines as _web_discovery_module
+
+    engine_WebDiscoveryEngine = getattr(_web_discovery_module, "WebDiscoveryEngine", None)
+    engine_get_web_discovery_engine = getattr(_web_discovery_module, "get_engine", None)
+    engine_WEB_DISCOVERY_REGISTRY = getattr(_web_discovery_module, "ENGINE_REGISTRY", None)
+
+    engine_tls_fingerprint = getattr(_web_discovery_module, "tls_fingerprint", None)
+    engine_dns_history_reconstruct = getattr(_web_discovery_module, "dns_history_reconstruct", None)
+    engine_js_chunk_mine = getattr(_web_discovery_module, "js_chunk_mine", None)
+    engine_websocket_discovery = getattr(_web_discovery_module, "websocket_discovery", None)
+    engine_graphql_detect = getattr(_web_discovery_module, "graphql_detect", None)
+    engine_rest_api_enumerate = getattr(_web_discovery_module, "rest_api_enumerate", None)
+    engine_sitemap_deep_parse = getattr(_web_discovery_module, "sitemap_deep_parse", None)
+    engine_robots_edge_harvest = getattr(_web_discovery_module, "robots_edge_harvest", None)
+    engine_social_metadata_harvest = getattr(_web_discovery_module, "social_metadata_harvest", None)
+    engine_cdn_asset_hunt = getattr(_web_discovery_module, "cdn_asset_hunt", None)
+except Exception:
+    engine_WebDiscoveryEngine = None
+    engine_get_web_discovery_engine = None
+    engine_WEB_DISCOVERY_REGISTRY = None
+    engine_tls_fingerprint = None
+    engine_dns_history_reconstruct = None
+    engine_js_chunk_mine = None
+    engine_websocket_discovery = None
+    engine_graphql_detect = None
+    engine_rest_api_enumerate = None
+    engine_sitemap_deep_parse = None
+    engine_robots_edge_harvest = None
+    engine_social_metadata_harvest = None
+    engine_cdn_asset_hunt = None
+
+    try:
+        import importlib.util as _web_discovery_importlib_util
+        import sys as _web_discovery_sys
+
+        _web_discovery_candidates: List[Path] = []
+        try:
+            _web_discovery_candidates.append(Path(__file__).resolve().parent / "web_discovery_engines.py")
+        except Exception:
+            pass
+        _web_discovery_candidates.append(Path.cwd() / "web_discovery_engines.py")
+        _web_discovery_candidates.append(Path.home() / ".promptchat" / "web_discovery_engines.py")
+        _web_discovery_candidates.append(Path.home() / ".promptchat" / "engines" / "web_discovery_engines.py")
+
+        for _web_discovery_path in _web_discovery_candidates:
+            try:
+                if not _web_discovery_path.exists():
+                    continue
+
+                _web_discovery_spec = _web_discovery_importlib_util.spec_from_file_location(
+                    "web_discovery_engines",
+                    str(_web_discovery_path),
+                )
+                if _web_discovery_spec is None or _web_discovery_spec.loader is None:
+                    continue
+
+                _web_discovery_module = _web_discovery_importlib_util.module_from_spec(_web_discovery_spec)
+                _web_discovery_sys.modules.setdefault("web_discovery_engines", _web_discovery_module)
+                _web_discovery_spec.loader.exec_module(_web_discovery_module)
+
+                engine_WebDiscoveryEngine = getattr(_web_discovery_module, "WebDiscoveryEngine", None)
+                engine_get_web_discovery_engine = getattr(_web_discovery_module, "get_engine", None)
+                engine_WEB_DISCOVERY_REGISTRY = getattr(_web_discovery_module, "ENGINE_REGISTRY", None)
+
+                engine_tls_fingerprint = getattr(_web_discovery_module, "tls_fingerprint", None)
+                engine_dns_history_reconstruct = getattr(_web_discovery_module, "dns_history_reconstruct", None)
+                engine_js_chunk_mine = getattr(_web_discovery_module, "js_chunk_mine", None)
+                engine_websocket_discovery = getattr(_web_discovery_module, "websocket_discovery", None)
+                engine_graphql_detect = getattr(_web_discovery_module, "graphql_detect", None)
+                engine_rest_api_enumerate = getattr(_web_discovery_module, "rest_api_enumerate", None)
+                engine_sitemap_deep_parse = getattr(_web_discovery_module, "sitemap_deep_parse", None)
+                engine_robots_edge_harvest = getattr(_web_discovery_module, "robots_edge_harvest", None)
+                engine_social_metadata_harvest = getattr(_web_discovery_module, "social_metadata_harvest", None)
+                engine_cdn_asset_hunt = getattr(_web_discovery_module, "cdn_asset_hunt", None)
+                break
+            except Exception:
+                engine_WebDiscoveryEngine = None
+                engine_get_web_discovery_engine = None
+                engine_WEB_DISCOVERY_REGISTRY = None
+                engine_tls_fingerprint = None
+                engine_dns_history_reconstruct = None
+                engine_js_chunk_mine = None
+                engine_websocket_discovery = None
+                engine_graphql_detect = None
+                engine_rest_api_enumerate = None
+                engine_sitemap_deep_parse = None
+                engine_robots_edge_harvest = None
+                engine_social_metadata_harvest = None
+                engine_cdn_asset_hunt = None
+    except Exception:
+        engine_WebDiscoveryEngine = None
+        engine_get_web_discovery_engine = None
+        engine_WEB_DISCOVERY_REGISTRY = None
+        engine_tls_fingerprint = None
+        engine_dns_history_reconstruct = None
+        engine_js_chunk_mine = None
+        engine_websocket_discovery = None
+        engine_graphql_detect = None
+        engine_rest_api_enumerate = None
+        engine_sitemap_deep_parse = None
+        engine_robots_edge_harvest = None
+        engine_social_metadata_harvest = None
+        engine_cdn_asset_hunt = None
+
+
 DEFAULT_WEB_TIMEOUT_SEC = 20
 DEFAULT_MAX_PAGE_CHARS = 12000
 DEFAULT_TOR_SOCKS_URL = "socks5h://127.0.0.1:9150"
@@ -9315,6 +9427,252 @@ def _register_project_tools(
     )
 
 
+# ======================= Web Discovery Engine Tool Wrappers ================
+def _web_discovery_engine_available() -> bool:
+    return engine_WebDiscoveryEngine is not None or any(
+        fn is not None
+        for fn in (
+            engine_tls_fingerprint,
+            engine_dns_history_reconstruct,
+            engine_js_chunk_mine,
+            engine_websocket_discovery,
+            engine_graphql_detect,
+            engine_rest_api_enumerate,
+            engine_sitemap_deep_parse,
+            engine_robots_edge_harvest,
+            engine_social_metadata_harvest,
+            engine_cdn_asset_hunt,
+        )
+    )
+
+
+def _web_discovery_engine_unavailable_result() -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "web_discovery_engine_available": False,
+        "error": "web_discovery_engines.py is not importable. Put web_discovery_engines.py beside tools.py.",
+    }
+
+
+def _engine_report_to_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "to_dict"):
+        try:
+            out = value.to_dict()
+            if isinstance(out, dict):
+                return out
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            return dict(value.__dict__)
+        except Exception:
+            pass
+    return {"ok": True, "result": value}
+
+
+def _web_discovery_schema(required: Optional[List[str]] = None) -> Dict[str, Any]:
+    return _schema(
+        {
+            "url": {"type": "string", "description": "HTTP/HTTPS URL to analyze."},
+            "domain": {"type": "string", "description": "Domain name for DNS-history style checks."},
+            "target": {"type": "string", "description": "URL/domain fallback target."},
+            "action": {
+                "type": "string",
+                "description": "Generic web discovery action.",
+                "enum": [
+                    "status",
+                    "tls",
+                    "tls_fingerprint",
+                    "dns_history",
+                    "dns_history_reconstruct",
+                    "js",
+                    "js_chunk_mine",
+                    "websocket",
+                    "websocket_discovery",
+                    "graphql",
+                    "graphql_detect",
+                    "rest",
+                    "rest_api_enumerate",
+                    "sitemap",
+                    "sitemap_deep_parse",
+                    "robots",
+                    "robots_edge_harvest",
+                    "social",
+                    "social_metadata_harvest",
+                    "cdn",
+                    "cdn_asset_hunt",
+                    "all_passive",
+                ],
+                "default": "status",
+            },
+            "engine": {"type": "string", "description": "Optional engine alias when action='scan'."},
+            "depth": {"type": "integer", "minimum": 0, "maximum": 10, "default": 3},
+            "params": {"type": "object", "additionalProperties": True},
+        },
+        required=required or [],
+    )
+
+
+def _call_web_discovery_fn(fn: Any, name: str, **kwargs: Any) -> Dict[str, Any]:
+    if fn is None:
+        result = _web_discovery_engine_unavailable_result()
+        result["tool"] = name
+        result["received"] = kwargs
+        return result
+    try:
+        if name == "dns_history_reconstruct":
+            domain = kwargs.get("domain") or kwargs.get("url") or kwargs.get("target")
+            return _engine_report_to_dict(fn(str(domain)))
+        if name == "rest_api_enumerate":
+            url = kwargs.get("url") or kwargs.get("target")
+            return _engine_report_to_dict(fn(str(url), depth=int(kwargs.get("depth", 3))))
+        url = kwargs.get("url") or kwargs.get("target")
+        return _engine_report_to_dict(fn(str(url)))
+    except Exception as exc:
+        return {"ok": False, "tool": name, "error": str(exc)}
+
+
+def web_discovery(
+    action: str = "status",
+    url: str = "",
+    domain: str = "",
+    target: str = "",
+    engine: str = "",
+    depth: int = 3,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generic passive web discovery multiplexer."""
+    if engine_WebDiscoveryEngine is None:
+        result = _web_discovery_engine_unavailable_result()
+        result.update({"action": action, "url": url, "domain": domain, "target": target, "engine": engine, "depth": depth})
+        return result
+    try:
+        payload: Dict[str, Any] = dict(params or {})
+        if url:
+            payload["url"] = url
+        if domain:
+            payload["domain"] = domain
+        if target:
+            payload["target"] = target
+        if engine:
+            payload["engine"] = engine
+        payload.setdefault("depth", depth)
+        report = engine_WebDiscoveryEngine().run(action or "status", payload)
+        return _engine_report_to_dict(report)
+    except Exception as exc:
+        return {"ok": False, "tool": "web_discovery", "action": action, "error": str(exc)}
+
+
+def web_discovery_status() -> Dict[str, Any]:
+    """Return web_discovery_engine availability and exposed wrappers."""
+    actions = sorted(engine_WEB_DISCOVERY_REGISTRY.keys()) if isinstance(engine_WEB_DISCOVERY_REGISTRY, dict) else []
+    return {
+        "ok": _web_discovery_engine_available(),
+        "web_discovery_engine_available": _web_discovery_engine_available(),
+        "actions": actions,
+        "tools": [
+            "web_discovery",
+            "web_discovery_status",
+            "web_tls_fingerprint",
+            "web_dns_history_reconstruct",
+            "web_js_chunk_mine",
+            "web_websocket_discovery",
+            "web_graphql_detect",
+            "web_rest_api_enumerate",
+            "web_sitemap_deep_parse",
+            "web_robots_edge_harvest",
+            "web_social_metadata_harvest",
+            "web_cdn_asset_hunt",
+            "web_all_passive_scan",
+        ],
+    }
+
+
+def web_tls_fingerprint(url: str) -> Dict[str, Any]:
+    """Analyze SSL/TLS certificate and handshake characteristics for a URL."""
+    return _call_web_discovery_fn(engine_tls_fingerprint, "tls_fingerprint", url=url)
+
+
+def web_dns_history_reconstruct(domain: str) -> Dict[str, Any]:
+    """Recover passive historical DNS/IP hints for a domain from public archives."""
+    return _call_web_discovery_fn(engine_dns_history_reconstruct, "dns_history_reconstruct", domain=domain)
+
+
+def web_js_chunk_mine(url: str) -> Dict[str, Any]:
+    """Extract function/chunk hints from linked JavaScript bundles without source maps."""
+    return _call_web_discovery_fn(engine_js_chunk_mine, "js_chunk_mine", url=url)
+
+
+def web_websocket_discovery(url: str) -> Dict[str, Any]:
+    """Find WebSocket URL hints in HTML and linked JavaScript."""
+    return _call_web_discovery_fn(engine_websocket_discovery, "websocket_discovery", url=url)
+
+
+def web_graphql_detect(url: str) -> Dict[str, Any]:
+    """Detect likely GraphQL endpoints passively and with safe HEAD/OPTIONS probes."""
+    return _call_web_discovery_fn(engine_graphql_detect, "graphql_detect", url=url)
+
+
+def web_rest_api_enumerate(url: str, depth: int = 3) -> Dict[str, Any]:
+    """Check common REST/API route prefixes using safe HEAD/OPTIONS probes."""
+    return _call_web_discovery_fn(engine_rest_api_enumerate, "rest_api_enumerate", url=url, depth=depth)
+
+
+def web_sitemap_deep_parse(url: str) -> Dict[str, Any]:
+    """Extract URLs from sitemap.xml and nested sitemap indexes."""
+    return _call_web_discovery_fn(engine_sitemap_deep_parse, "sitemap_deep_parse", url=url)
+
+
+def web_robots_edge_harvest(url: str) -> Dict[str, Any]:
+    """Find interesting Allow/Disallow/Sitemap rules in robots.txt."""
+    return _call_web_discovery_fn(engine_robots_edge_harvest, "robots_edge_harvest", url=url)
+
+
+def web_social_metadata_harvest(url: str) -> Dict[str, Any]:
+    """Extract OpenGraph, Twitter Card, canonical, alternates, and JSON-LD metadata."""
+    return _call_web_discovery_fn(engine_social_metadata_harvest, "social_metadata_harvest", url=url)
+
+
+def web_cdn_asset_hunt(url: str) -> Dict[str, Any]:
+    """Harvest linked asset hosts and CDN provider hints from HTML."""
+    return _call_web_discovery_fn(engine_cdn_asset_hunt, "cdn_asset_hunt", url=url)
+
+
+def web_all_passive_scan(url: str, domain: str = "", depth: int = 3) -> Dict[str, Any]:
+    """Run all passive web discovery checks for one URL."""
+    return web_discovery(action="all_passive", url=url, domain=domain or url, depth=depth)
+
+
+def _register_web_discovery_engine_tools(tools: ToolRegistry) -> None:
+    """Register web_discovery_engines.py tools without changing any old signatures."""
+    tools.register(
+        ToolSpec(
+            name="web_discovery",
+            description=(
+                "Generic passive web-discovery multiplexer. Use for TLS certificate checks, DNS-history hints, "
+                "JS bundle function mining, WebSocket hints, GraphQL endpoint hints, REST route HEAD/OPTIONS checks, "
+                "sitemap parsing, robots.txt analysis, social metadata harvesting, CDN asset hints, or all_passive scans."
+            ),
+            parameters=_web_discovery_schema(),
+            fn=web_discovery,
+        )
+    )
+    tools.register(ToolSpec(name="web_discovery_status", description="Return web discovery engine availability and exposed tools.", parameters=_schema({}), fn=lambda: web_discovery_status()))
+    tools.register(ToolSpec(name="web_tls_fingerprint", description="Analyze SSL/TLS certificate and handshake characteristics for a URL.", parameters=_web_discovery_schema(["url"]), fn=web_tls_fingerprint))
+    tools.register(ToolSpec(name="web_dns_history_reconstruct", description="Recover passive historical DNS/IP hints for a domain from public archives.", parameters=_web_discovery_schema(["domain"]), fn=web_dns_history_reconstruct))
+    tools.register(ToolSpec(name="web_js_chunk_mine", description="Extract code chunk/function hints from linked JavaScript bundles without source maps.", parameters=_web_discovery_schema(["url"]), fn=web_js_chunk_mine))
+    tools.register(ToolSpec(name="web_websocket_discovery", description="Find hidden WebSocket URL hints in HTML and linked JavaScript.", parameters=_web_discovery_schema(["url"]), fn=web_websocket_discovery))
+    tools.register(ToolSpec(name="web_graphql_detect", description="Detect likely GraphQL endpoints from HTML/JS and safe common-path HEAD/OPTIONS probes.", parameters=_web_discovery_schema(["url"]), fn=web_graphql_detect))
+    tools.register(ToolSpec(name="web_rest_api_enumerate", description="Check common REST/API route prefixes using safe HEAD/OPTIONS probes.", parameters=_web_discovery_schema(["url"]), fn=web_rest_api_enumerate))
+    tools.register(ToolSpec(name="web_sitemap_deep_parse", description="Extract URLs from sitemap.xml and nested sitemap indexes.", parameters=_web_discovery_schema(["url"]), fn=web_sitemap_deep_parse))
+    tools.register(ToolSpec(name="web_robots_edge_harvest", description="Find interesting Allow/Disallow/Sitemap rules in robots.txt.", parameters=_web_discovery_schema(["url"]), fn=web_robots_edge_harvest))
+    tools.register(ToolSpec(name="web_social_metadata_harvest", description="Extract OpenGraph, Twitter Card, canonical, alternates, and JSON-LD metadata.", parameters=_web_discovery_schema(["url"]), fn=web_social_metadata_harvest))
+    tools.register(ToolSpec(name="web_cdn_asset_hunt", description="Harvest linked asset hosts and CDN provider hints from HTML.", parameters=_web_discovery_schema(["url"]), fn=web_cdn_asset_hunt))
+    tools.register(ToolSpec(name="web_all_passive_scan", description="Run all passive web discovery checks for one URL.", parameters=_web_discovery_schema(["url"]), fn=web_all_passive_scan))
+
+
 def build_default_tool_registry(
     *,
     tor_socks_url: str = DEFAULT_TOR_SOCKS_URL,
@@ -10034,4 +10392,7 @@ def build_default_tool_registry(
     _register_engines_tools(tools)
     _register_packet_tools(tools)
     _register_project_tools(tools, app_config)
+
+    # Passive web discovery engine tools
+    _register_web_discovery_engine_tools(tools)
     return tools

@@ -48,7 +48,7 @@ except Exception:
                 pass
     DEBUG_LOGGER = _FallbackDebugLogger()
 
-ENGINE_VERSION = "2026.06.04-codegen-support-brain"
+ENGINE_VERSION = "2026.06.07-finish-actions-codegen-brain"
 DEFAULT_MAX_CHARS = 120_000
 DEFAULT_MAX_SNIPPETS = 24
 DEFAULT_MAX_TOKENS = 8_000
@@ -1465,11 +1465,48 @@ class CodingEngine:
 
     def action_complete_code(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params = params or {}
-        prefix = _safe_text(params.get("prefix") or payload or "")
+        prefix = _safe_text(params.get("prefix") or params.get("code") or payload or "", 240_000)
+        completion = _safe_text(params.get("completion") or params.get("suffix") or params.get("append") or "", 240_000)
         task = str(params.get("task") or "complete this code")
-        pack = self._make_pack({"code": prefix}, {**params, "task": task}, "complete_code")
-        suffix = "\n    pass\n" if prefix.rstrip().endswith(":") else "\n# TODO: continue implementation using the context pack above.\n"
-        return {"ok": True, "code": prefix.rstrip() + suffix, "pack": pack.to_dict()}
+        language = str(params.get("language") or detect_language(prefix)).lower()
+        code = (prefix.rstrip() + "\n" + completion.lstrip()) if completion else prefix.rstrip()
+
+        changes: List[str] = []
+        if language == "python" and code:
+            # Make incomplete Python fragments syntactically finishable without leaving TODO loops.
+            lines = code.splitlines()
+            if lines and lines[-1].rstrip().endswith(":"):
+                indent = len(lines[-1]) - len(lines[-1].lstrip()) + 4
+                lines.append(" " * indent + "pass")
+                changes.append("inserted pass for trailing block header")
+            code = "\n".join(lines).rstrip() + "\n"
+            repaired = self.action_repair_code(code, {"language": "python"})
+            if repaired.get("ok") and repaired.get("code"):
+                code = str(repaired.get("code"))
+                changes.extend(repaired.get("changes") or [])
+
+        validation = self.action_validate_syntax(code, {"language": language})
+        pack = self._make_pack({"code": code}, {**params, "task": task}, "complete_code")
+        result = {
+            "ok": bool(validation.get("ok", True)),
+            "code": code,
+            "final_code": code,
+            "language": language,
+            "validation": validation,
+            "changes": changes,
+            "pack": pack.to_dict(),
+            "finished": True,
+            "done": True,
+            "action_complete": True,
+            "should_continue": False,
+            "requires_more_tool_calls": False,
+            "stop_tool_loop": True,
+            "next_action": "final_answer",
+            "final_answer": code,
+            "answer": code,
+            "response": code,
+        }
+        return result
 
     def action_rewrite_code(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params = params or {}
@@ -1489,6 +1526,167 @@ class CodingEngine:
         prompt = self._render_generation_prompt(pack) + f"\n\nConvert this {source_language} code to {target_language}:\n```{source_language}\n{code}\n```"
         return {"ok": True, "source_language": source_language, "target_language": target_language, "prompt": prompt, "pack": pack.to_dict()}
 
+
+    # -----------------------------------------------------------------------
+    # Finish/finalization actions
+    # -----------------------------------------------------------------------
+    def _payload_get(self, payload: Any, *keys: str, default: Any = None) -> Any:
+        if isinstance(payload, dict):
+            for key in keys:
+                if key in payload and payload.get(key) is not None:
+                    return payload.get(key)
+        return default
+
+    def _finalize_payload(
+        self,
+        *,
+        final_answer: str = "",
+        code: str = "",
+        language: str = "",
+        data: Optional[Dict[str, Any]] = None,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        """Create a result shape that tells a GPT/tool runtime the action is done."""
+        language = (language or detect_language(code) if code else language or "text").lower()
+        final_answer = _safe_text(final_answer or code or note or "Action completed.", 240_000)
+        result: Dict[str, Any] = {
+            "ok": True,
+            "finished": True,
+            "done": True,
+            "action_complete": True,
+            "should_continue": False,
+            "requires_more_tool_calls": False,
+            "requires_followup": False,
+            "stop_tool_loop": True,
+            "next_action": "final_answer",
+            "tool_status": "complete",
+            "final_answer": final_answer,
+            "answer": final_answer,
+            "response": final_answer,
+            "assistant_message": final_answer,
+            "language": language,
+        }
+        if code:
+            result["code"] = code
+            result["final_code"] = code
+            result["validation"] = self.action_validate_syntax(code, {"language": language})
+            try:
+                result["score"] = self.action_score_generated_code(code, {"language": language}).get("score")
+            except Exception:
+                pass
+        if note:
+            result["note"] = note
+        if data:
+            result.update(data)
+        return result
+
+    def _normalize_finish_params(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Tuple[str, str, str]:
+        params = params or {}
+        code = _safe_text(
+            params.get("final_code")
+            or params.get("code")
+            or params.get("generated_code")
+            or self._payload_get(payload, "final_code", "code", "generated_code", default="")
+            or "",
+            240_000,
+        )
+        final_answer = _safe_text(
+            params.get("final_answer")
+            or params.get("answer")
+            or params.get("message")
+            or params.get("text")
+            or self._payload_get(payload, "final_answer", "answer", "message", "text", default="")
+            or (payload if isinstance(payload, str) and not code else "")
+            or "",
+            240_000,
+        )
+        language = str(params.get("language") or self._payload_get(payload, "language", default="") or detect_language(code) or "text").lower()
+        return final_answer, code, language
+
+    def action_finish_action(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Mark a coding-engine action as complete and return final-answer fields.
+
+        This is intentionally redundant: many tool runtimes look for different
+        keys.  Returning all of them prevents GPT from calling another tool just
+        to say the action is finished.
+        """
+        params = params or {}
+        final_answer, code, language = self._normalize_finish_params(payload, params)
+        auto_format = _coerce_bool(params.get("auto_format"), True)
+        if code and auto_format:
+            formatted = self.action_format_generated_code(code, {"language": language})
+            if formatted.get("ok") and formatted.get("code"):
+                code = str(formatted.get("code"))
+        note = str(params.get("note") or "Coding action finished; return final_answer to the user.")
+        return self._finalize_payload(final_answer=final_answer, code=code, language=language, note=note)
+
+    def action_finalize_result(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.action_finish_action(payload, params)
+
+    def action_finish(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.action_finish_action(payload, params)
+
+    def action_done(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.action_finish_action(payload, params)
+
+    def action_final(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.action_finish_action(payload, params)
+
+    def action_complete_action(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Generate or accept code, validate it, and return a final tool result.
+
+        If `code`/`final_code` is supplied, it finalizes that code.  Otherwise it
+        generates a script/module/class/function/engine template from `kind` and
+        finalizes the generated result so GPT can stop using tools and answer.
+        """
+        params = dict(params or {})
+        final_answer, code, language = self._normalize_finish_params(payload, params)
+        if code or final_answer:
+            return self.action_finish_action(payload, params)
+
+        kind = str(params.get("kind") or params.get("template") or params.get("type") or "script").strip().lower()
+        kind_aliases = {
+            "code": "script", "cli": "script", "command": "script", "cmd": "script",
+            "tool": "tool_wrapper", "wrapper": "tool_wrapper", "test": "tests", "requirements.txt": "requirements",
+        }
+        kind = kind_aliases.get(kind, kind)
+        generate_action = f"generate_{kind}"
+        method = getattr(self, f"action_{generate_action}", None)
+        if method is None:
+            method = self.action_generate_script
+            generate_action = "generate_script"
+        generated = method(payload=payload, params=params)
+        gen_code = str(generated.get("code") or generated.get("text") or "") if isinstance(generated, dict) else str(generated)
+        return self._finalize_payload(
+            final_answer=gen_code or f"Completed action: {generate_action}",
+            code=gen_code,
+            language=str(generated.get("language") or language or "python") if isinstance(generated, dict) else language,
+            data={"generated": generated, "completed_from_action": generate_action},
+            note="Generated output was finalized so the GPT runtime can stop calling tools.",
+        )
+
+    def action_finish_generated_code(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.action_complete_action(payload, params)
+
+    def action_plan_next_action(self, payload: Any = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Small decision helper for GPT: choose whether to call another tool or finish."""
+        params = params or {}
+        has_code = bool(params.get("code") or self._payload_get(payload, "code", "final_code", default=""))
+        has_answer = bool(params.get("answer") or params.get("final_answer") or self._payload_get(payload, "answer", "final_answer", default=""))
+        if has_code or has_answer:
+            return self._finalize_payload(
+                final_answer="The available result is ready. Call finish_action/finalize_result or answer the user now.",
+                data={"recommended_action": "finish_action", "should_call_tool": False},
+            )
+        return {
+            "ok": True,
+            "finished": False,
+            "should_continue": True,
+            "recommended_action": "build_context_pack",
+            "reason": "No code or final answer was supplied yet.",
+            "actions": CODE_GENERATION_ACTIONS,
+        }
+
     def run(self, action: str = "status", payload: Any = None, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
         if kwargs:
             params = dict(params or {})
@@ -1496,10 +1694,30 @@ class CodingEngine:
         params = params or {}
         action = (action or "status").strip().lower()
         aliases = {
-            "help": "status", "search_syntax": "search_snippets", "search_api_usage": "search_snippets",
-            "build_context": "build_context_pack", "context_pack": "build_context_pack",
-            "syntax_pack": "build_syntax_pack", "token_pack": "build_token_pack", "make_prompt": "make_generation_prompt",
-            "generate_code": "generate_script", "validate": "validate_syntax", "format_code": "format_generated_code", "score_code": "score_generated_code",
+            "help": "status",
+            "actions": "status",
+            "search_syntax": "search_snippets",
+            "search_api_usage": "search_snippets",
+            "build_context": "build_context_pack",
+            "context_pack": "build_context_pack",
+            "syntax_pack": "build_syntax_pack",
+            "token_pack": "build_token_pack",
+            "make_prompt": "make_generation_prompt",
+            "prompt": "make_generation_prompt",
+            "generate_code": "generate_script",
+            "generate": "generate_script",
+            "validate": "validate_syntax",
+            "format_code": "format_generated_code",
+            "score_code": "score_generated_code",
+            "finish": "finish_action",
+            "final": "finish_action",
+            "done": "finish_action",
+            "complete": "complete_action",
+            "complete_task": "complete_action",
+            "finalize": "finalize_result",
+            "finalize_action": "finalize_result",
+            "finish_code": "finish_generated_code",
+            "final_code": "finish_generated_code",
         }
         action = aliases.get(action, action)
         if action == "status":
@@ -1513,20 +1731,54 @@ class CodingEngine:
                 result.setdefault("ok", True)
                 result.setdefault("engine", "coding_engine")
                 result.setdefault("action", action)
+                # These fields let a GPT tool runtime stop cleanly after a successful action.
+                result.setdefault("finished", True)
+                result.setdefault("done", True)
+                result.setdefault("action_complete", True)
+                result.setdefault("should_continue", False)
+                result.setdefault("requires_more_tool_calls", False)
+                result.setdefault("requires_followup", False)
+                result.setdefault("stop_tool_loop", True)
+                result.setdefault("next_action", "final_answer")
+                if "code" in result and "final_answer" not in result:
+                    result["final_answer"] = result.get("code")
+                if "prompt" in result and "assistant_instruction" not in result:
+                    result["assistant_instruction"] = "Use this prompt/context internally, then answer the user directly without another tool call."
+                if "final_answer" in result:
+                    result.setdefault("answer", result.get("final_answer"))
+                    result.setdefault("response", result.get("final_answer"))
+                    result.setdefault("assistant_message", result.get("final_answer"))
                 return result
-            return {"ok": True, "engine": "coding_engine", "action": action, "result": result}
+            return {
+                "ok": True,
+                "engine": "coding_engine",
+                "action": action,
+                "result": result,
+                "finished": True,
+                "done": True,
+                "action_complete": True,
+                "should_continue": False,
+                "requires_more_tool_calls": False,
+                "stop_tool_loop": True,
+                "next_action": "final_answer",
+                "final_answer": str(result),
+            }
         except Exception as exc:
             return {"ok": False, "engine": "coding_engine", "action": action, "error": str(exc), "traceback": traceback.format_exc()[-6000:]}
 
 
 CODE_GENERATION_ACTIONS = [
-    "status", "tokenize_code", "parse_code", "extract_symbols", "extract_imports", "extract_signatures",
-    "extract_docstrings", "extract_dependencies", "extract_style", "extract_patterns", "search_snippets",
-    "search_syntax", "search_api_usage", "rank_snippets", "dedupe_snippets", "build_token_pack",
-    "build_syntax_pack", "build_context_pack", "make_generation_prompt", "generate_script", "generate_module",
-    "generate_class", "generate_function", "generate_cli", "generate_gui", "generate_engine", "generate_tool_wrapper",
-    "generate_tests", "generate_requirements", "complete_code", "repair_code", "rewrite_code", "convert_code",
-    "explain_code_error", "explain_syntax", "validate_syntax", "format_generated_code", "score_generated_code",
+    "status",
+    "tokenize_code", "parse_code", "extract_symbols", "extract_imports", "extract_signatures",
+    "extract_docstrings", "extract_dependencies", "extract_style", "extract_patterns",
+    "search_snippets", "search_syntax", "search_api_usage", "rank_snippets", "dedupe_snippets",
+    "build_token_pack", "build_syntax_pack", "build_context_pack", "make_generation_prompt",
+    "generate_script", "generate_module", "generate_class", "generate_function", "generate_cli",
+    "generate_gui", "generate_engine", "generate_tool_wrapper", "generate_tests", "generate_requirements",
+    "complete_code", "complete_action", "finish_action", "finish_generated_code", "finalize_result",
+    "finish", "done", "final", "plan_next_action",
+    "repair_code", "rewrite_code", "convert_code", "explain_code_error", "explain_syntax",
+    "validate_syntax", "format_generated_code", "score_generated_code",
 ]
 
 _DEFAULT_ENGINE = CodingEngine()
@@ -1552,6 +1804,8 @@ def coding_engine_tool_schema() -> Dict[str, Any]:
                     "constraints": {"type": "array", "items": {"type": "string"}}, "name": {"type": "string"},
                     "module_name": {"type": "string"}, "function_name": {"type": "string"}, "class_name": {"type": "string"},
                     "instructions": {"type": "string"}, "source_language": {"type": "string"}, "target_language": {"type": "string"},
+                    "final_answer": {"type": "string"}, "final_code": {"type": "string"}, "kind": {"type": "string"},
+                    "auto_format": {"type": "boolean", "default": True},
                 },
             },
         },
